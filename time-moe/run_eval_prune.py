@@ -14,8 +14,8 @@ from transformers import AutoModelForCausalLM
 
 from time_moe.datasets.benchmark_dataset import BenchmarkEvalDataset, GeneralEvalDataset
 
-# # Configure CUDA device
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Configure CUDA device
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 def setup_nccl(rank, world_size, master_addr='127.0.0.1', master_port=9899):
     dist.init_process_group("nccl", init_method='tcp://{}:{}'.format(master_addr, master_port), rank=rank,
@@ -61,6 +61,7 @@ class TimeMoE:
                 device_map=device,
                 # attn_implementation='flash_attention_2',
                 torch_dtype='auto',
+                local_files_only=True,
             )
         except:
             model = AutoModelForCausalLM.from_pretrained(
@@ -69,6 +70,7 @@ class TimeMoE:
                 # attn_implementation='flash_attention_2',
                 torch_dtype='auto',
                 trust_remote_code=True,
+                local_files_only=True,
             )
 
         logging.info(f'>>> Model dtype: {model.dtype}; Attention:{model.config._attn_implementation}')
@@ -200,7 +202,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='Maple728/TimeMoE-50M',
+        default='/home/sa53869/time_series/time-moe/model_weights/time-moe-200m',
         help='Model path'
     )
     parser.add_argument(

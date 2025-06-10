@@ -1,0 +1,9 @@
+# time moe performance : ETTh1 context length vs performance, prediction length 96
+
+Length  MAE
+256     0.3981
+512     0.3816
+1024    0.3726
+2048    0.3756
+3072    0.3784
+4096    0.4284

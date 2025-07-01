@@ -512,14 +512,15 @@ def main():
         all_values.extend(all_ground_truths[i])
         all_values.extend(all_predictions[i])
     left_y_min, left_y_max = min(all_values), max(all_values)
-    left_y_margin = (left_y_max - left_y_min) * 0.05  # 5% margin
+    left_y_range = left_y_max - left_y_min
+    left_y_margin = max(left_y_range * 0.1, 0.01)  # 10% margin, minimum 0.01
     left_y_limits = (left_y_min - left_y_margin, left_y_max + left_y_margin)
+
+    # Calculate right axis limits - collect all entropy values and thresholds from both modes
+    all_entropy_values = []
+    all_threshold_values = []
     
-    # Calculate right axis limits for each mode separately
-    right_y_limits = {}
     for mode_name, is_monotonic in modes.items():
-        all_entropy_values = []
-        all_threshold_values = []
         for i in range(3):
             if is_monotonic:
                 entropy_diff = np.diff(all_entropies[i])
@@ -527,11 +528,13 @@ def main():
             else:
                 all_entropy_values.extend(all_entropies[i])
             all_threshold_values.append(all_thresholds[mode_name][i])
-        
-        right_y_min = min(min(all_entropy_values), min(all_threshold_values))
-        right_y_max = max(max(all_entropy_values), max(all_threshold_values))
-        right_y_margin = (right_y_max - right_y_min) * 0.05  # 5% margin
-        right_y_limits[mode_name] = (right_y_min - right_y_margin, right_y_max + right_y_margin)
+    
+    # Use the same limits for both modes
+    right_y_min = min(min(all_entropy_values), min(all_threshold_values))
+    right_y_max = max(max(all_entropy_values), max(all_threshold_values))
+    right_y_range = right_y_max - right_y_min
+    right_y_margin = max(right_y_range * 0.1, 0.01)  # 10% margin, minimum 0.01
+    right_y_limits = (right_y_min - right_y_margin, right_y_max + right_y_margin)
     
     print(f"\n=== Creating combined plots with both modes ===")
     
@@ -603,7 +606,7 @@ def main():
             
             # Set consistent y-axis limits
             ax.set_ylim(left_y_limits)
-            ax_twin.set_ylim(right_y_limits[mode_name])
+            ax_twin.set_ylim(right_y_limits)
             
             # Add legends
             lines1, labels1 = ax.get_legend_handles_labels()

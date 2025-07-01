@@ -9,8 +9,8 @@ python create_patches_with_si.py --csv_path ../datasets/time-moe-eval/electricit
 
 
 
-python create_patches_with_entropy.py --csv_path ../datasets/entropy_signal.csv --col_num 1 --threshold_search_k 10000
+python create_patches_with_entropy.py --csv_path ../datasets/entropy_signal.csv --col_num 1 --gpu 1 
 
-python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --col_num 1 --threshold_search_k 10000
+python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --col_num 1 --gpu 1 
  
-python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/electricity.csv --col_num 1 --threshold_search_k 10000
+python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/electricity.csv --col_num 1 --gpu 0 

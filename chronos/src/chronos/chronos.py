@@ -320,7 +320,8 @@ class ChronosModel(nn.Module):
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-    ) -> torch.Tensor:
+        return_logits: bool = False,  # New parameter
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Predict future sample tokens for the given token sequences.
 
@@ -348,7 +349,7 @@ class ChronosModel(nn.Module):
 
         assert hasattr(self.model, "generate")
 
-        preds = self.model.generate(
+        generation_output = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             generation_config=GenerationConfig(
@@ -361,9 +362,13 @@ class ChronosModel(nn.Module):
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                return_dict_in_generate=True,  # Enable dict output
+                output_scores=True,  # Get logits for each generation step
             ),
         )
-
+        
+        preds = generation_output.sequences
+    
         if self.config.model_type == "seq2seq":
             preds = preds[..., 1:]  # remove the decoder start token
         else:
@@ -371,7 +376,17 @@ class ChronosModel(nn.Module):
             assert preds.size(-1) == input_ids.size(-1) + prediction_length
             preds = preds[..., -prediction_length:]
 
-        return preds.reshape(input_ids.size(0), num_samples, -1)
+        predictions = preds.reshape(input_ids.size(0), num_samples, -1)
+        
+        if return_logits:
+            # generation_output.scores contains logits for each generation step
+            # Convert to probabilities and reshape appropriately
+            logits = torch.stack(generation_output.scores, dim=1)  # (batch_size * num_samples, seq_len, vocab_size)
+            logits = logits.reshape(input_ids.size(0), num_samples, prediction_length, -1)
+
+            return predictions, logits
+        
+        return predictions
 
 
 class ChronosPipeline(BaseChronosPipeline):
@@ -447,7 +462,7 @@ class ChronosPipeline(BaseChronosPipeline):
         ).cpu()
         return embeddings, tokenizer_state
 
-    def predict(  # type: ignore[override]
+    def predict(
         self,
         context: Union[torch.Tensor, List[torch.Tensor]],
         prediction_length: Optional[int] = None,
@@ -456,7 +471,8 @@ class ChronosPipeline(BaseChronosPipeline):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         limit_prediction_length: bool = False,
-    ) -> torch.Tensor:
+        return_logits: bool = False,  # New parameter
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Get forecasts for the given time series.
 
@@ -505,21 +521,37 @@ class ChronosPipeline(BaseChronosPipeline):
             logger.warning(msg)
 
         predictions = []
+        all_logits = [] if return_logits else None
         remaining = prediction_length
 
         while remaining > 0:
             token_ids, attention_mask, scale = self.tokenizer.context_input_transform(
                 context_tensor
             )
-            samples = self.model(
-                token_ids.to(self.model.device),
-                attention_mask.to(self.model.device),
-                min(remaining, self.model.config.prediction_length),
-                num_samples,
-                temperature,
-                top_k,
-                top_p,
-            )
+            
+            if return_logits:
+                samples, logits = self.model(
+                    token_ids.to(self.model.device),
+                    attention_mask.to(self.model.device),
+                    min(remaining, self.model.config.prediction_length),
+                    num_samples,
+                    temperature,
+                    top_k,
+                    top_p,
+                    return_logits=True,
+                )
+                all_logits.append(logits)
+            else:
+                samples = self.model(
+                    token_ids.to(self.model.device),
+                    attention_mask.to(self.model.device),
+                    min(remaining, self.model.config.prediction_length),
+                    num_samples,
+                    temperature,
+                    top_k,
+                    top_p,
+                    return_logits=False,
+                )
 
             prediction = self.tokenizer.output_transform(
                 samples.to(scale.device), scale
@@ -535,7 +567,13 @@ class ChronosPipeline(BaseChronosPipeline):
                 [context_tensor, prediction.median(dim=1).values], dim=-1
             )
 
-        return torch.cat(predictions, dim=-1).to(dtype=torch.float32, device="cpu")
+        final_predictions = torch.cat(predictions, dim=-1).to(dtype=torch.float32, device="cpu")
+        
+        if return_logits:
+            final_logits = torch.cat(all_logits, dim=2).to(dtype=torch.float32, device="cpu")
+            return final_predictions, final_logits
+        
+        return final_predictions
 
     def predict_quantiles(
         self,

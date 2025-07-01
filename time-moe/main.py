@@ -15,6 +15,7 @@ if __name__ == "__main__":
         "-m",
         type=str,
         default="Maple728/TimeMoE-50M",
+        # default="Maple728/TimeMoE-200M",
         help="Path to pretrained model. Default: Maple728/TimeMoE-50M",
     )
     parser.add_argument("--output_path", "-o", type=str, default="logs/time_moe")

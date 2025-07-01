@@ -1,0 +1,15 @@
+{
+  "dataset_name": "ETTm2",
+  "column_number": 1,
+  "column_name": "HUFL",
+  "n_points": 69680,
+  "n_bins": 100,
+  "strategy": "uniform",
+  "entropy_stats": {
+    "mean": 5.199632010226983,
+    "std": 1.0235146353621682,
+    "min": 4.552209787798099,
+    "max": 16.088457003486226
+  },
+  "timestamp": 1750868025
+}

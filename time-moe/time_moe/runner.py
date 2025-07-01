@@ -51,7 +51,10 @@ class TimeMoeRunner:
 
         if from_scatch:
             config = TimeMoeConfig.from_pretrained(model_path, _attn_implementation=attn)
+            original_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch.bfloat16)
             model = TimeMoeForPrediction(config)
+            torch.set_default_dtype(original_dtype)
         else:
             model = TimeMoeForPrediction.from_pretrained(model_path, **kwargs)
         return model

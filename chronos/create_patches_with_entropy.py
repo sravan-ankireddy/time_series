@@ -16,24 +16,34 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
         pipeline: The Chronos pipeline for prediction
         ground_truth_context: The ground truth time series data
         dataset_mean: Mean value of the dataset for initial context
-        max_context_length: Maximum context length to use (if None, uses unbounded context)
+        max_context_length: Maximum context length to use (if None, uses unbounded context until reaching model's max context, then sliding window)
+    
+    Returns:
+        predictions: Array of predicted values
+        entropies: Array of entropy values
+        all_logits: List of logits for each timestep (for vocabulary analysis)
     """
     predictions = []
     entropies = []
+    all_logits = []
     context_length = len(ground_truth_context)
+    
+    # If max_context_length is None, use model's default max context length (typically 1024 for Chronos)
+    # This ensures we use sliding window approach for threshold optimization too
+    effective_max_context = max_context_length if max_context_length is not None else 1024
     
     for i in tqdm(range(context_length), desc="Predicting samples"):
         if i == 0:
             # Use dataset mean for first prediction context
             context = torch.tensor([dataset_mean], dtype=torch.float32)
         else:
-            # Use ground truth values as context, limited by max_context_length
-            if max_context_length is not None and i > max_context_length:
-                # Keep only the latest max_context_length samples
-                start_idx = i - max_context_length
+            # Use ground truth values as context with sliding window approach
+            if i > effective_max_context:
+                # Keep only the latest effective_max_context samples (sliding window)
+                start_idx = i - effective_max_context
                 context = torch.tensor(ground_truth_context[start_idx:i], dtype=torch.float32)
             else:
-                # Use all available context from 0 to i-1
+                # Use all available context from 0 to i-1 (growing window)
                 context = torch.tensor(ground_truth_context[:i], dtype=torch.float32)
         
         # Get predictions with logits for entropy computation
@@ -47,6 +57,9 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
         # Extract logits for the predicted token
         token_logits = logits[0, 0, 0, :]  # Shape: [vocab_size]
         probs = torch.softmax(token_logits, dim=-1)
+
+        # Store logits for vocabulary analysis
+        all_logits.append(token_logits.cpu().numpy())
         
         # Compute entropy: H(X) = -sum(p(x) * log2(p(x)))
         entropy = -torch.sum(probs * torch.log2(probs + 1e-10)).item()
@@ -56,11 +69,11 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
         predicted_token = preds[0, 0, 0].item()
         predictions.append(predicted_token)
     
-    return np.array(predictions), np.array(entropies)
+    return np.array(predictions), np.array(entropies), all_logits
 
 
 def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_size=5, 
-                               monotonic_mode=False, fixed_threshold=None):
+                               relative_entropy_mode=False, fixed_threshold=None):
     """
     Detect patch boundaries based on entropy spikes.
     
@@ -68,15 +81,15 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
         entropies: Array of entropy values
         threshold_multiplier: Multiplier for mean entropy to determine spike threshold
         min_patch_size: Minimum size of a patch
-        monotonic_mode: If True, use Approximate Monotonic Constraint (diff-based)
+        relative_entropy_mode: If True, use Relative Entropy (diff-based)
         fixed_threshold: If not None, use this fixed threshold instead of calculating one
     
     Returns:
         patch_boundaries: List of patch boundary indices
         threshold: The threshold value used for spike detection
     """
-    if monotonic_mode:
-        # Approximate Monotonic Constraint: use differences between consecutive entropy values
+    if relative_entropy_mode:
+        # Relative Entropy: use differences between consecutive entropy values
         entropy_diffs = np.diff(entropies)
         
         if fixed_threshold is not None:
@@ -131,7 +144,7 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
     return patch_boundaries, threshold
 
 
-def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monotonic_mode=False, max_iterations=1000):
+def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relative_entropy_mode=False, max_iterations=1000):
     """
     Find the optimal threshold that produces patches with the target average size.
     
@@ -139,7 +152,7 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monot
         entropies: Array of entropy values for the entire dataset
         target_patch_size: Desired average patch size
         min_patch_size: Minimum size of a patch
-        monotonic_mode: If True, use Approximate Monotonic Constraint (diff-based)
+        relative_entropy_mode: If True, use Relative Entropy (diff-based)
         max_iterations: Maximum number of iterations to find optimal threshold
     
     Returns:
@@ -150,7 +163,7 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monot
     print(f"\nFinding optimal threshold for target patch size: {target_patch_size}")
     
     # Initial threshold estimate using standard method
-    if monotonic_mode:
+    if relative_entropy_mode:
         entropy_diffs = np.diff(entropies)
         positive_diffs = entropy_diffs[entropy_diffs > 0]
         if len(positive_diffs) > 0:
@@ -172,7 +185,7 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monot
         # Test current threshold
         patch_boundaries, _ = detect_patches_from_entropy(
             entropies, threshold_multiplier=None, min_patch_size=min_patch_size, 
-            monotonic_mode=monotonic_mode, fixed_threshold=current_threshold
+            relative_entropy_mode=relative_entropy_mode, fixed_threshold=current_threshold
         )
         
         num_patches = len(patch_boundaries) - 1
@@ -214,7 +227,7 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monot
     # Return best threshold found
     patch_boundaries, _ = detect_patches_from_entropy(
         entropies, threshold_multiplier=None, min_patch_size=min_patch_size,
-        monotonic_mode=monotonic_mode, fixed_threshold=best_threshold
+        relative_entropy_mode=relative_entropy_mode, fixed_threshold=best_threshold
     )
     num_patches = len(patch_boundaries) - 1
     final_avg_patch_size = len(entropies) / num_patches if num_patches > 0 else len(entropies)
@@ -244,13 +257,13 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
         entropy_arrays = entropies
     
     # Collect patch sizes for both modes
-    patch_sizes = {'absolute': [], 'monotonic': []}
+    patch_sizes = {'absolute_entropy': [], 'relative_entropy': []}
     
     for entropy_array in entropy_arrays:
-        for mode_name, is_monotonic in [('absolute', False), ('monotonic', True)]:
+        for mode_name, is_relative in [('absolute_entropy', False), ('relative_entropy', True)]:
             patch_boundaries, _ = detect_patches_from_entropy(
                 entropy_array, threshold_multiplier=None, min_patch_size=args.min_patch_size,
-                monotonic_mode=is_monotonic, fixed_threshold=optimal_thresholds[mode_name]
+                relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name]
             )
             
             # Calculate individual patch sizes
@@ -261,7 +274,7 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
     # Create histogram plot
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    colors = {'absolute': 'blue', 'monotonic': 'red'}
+    colors = {'absolute_entropy': 'blue', 'relative_entropy': 'red'}
     
     for i, (mode_name, sizes) in enumerate(patch_sizes.items()):
         ax = ax1 if i == 0 else ax2
@@ -279,7 +292,7 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
             stats_text = f'Mean: {mean_size:.1f}\nMedian: {median_size:.1f}\nStd: {std_size:.1f}\nCount: {len(sizes)}'
             ax.text(0.7, 0.8, stats_text, transform=ax.transAxes, 
                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                   verticalalignment='top')
+                   verticalalignment='top', fontsize=16)
             
             # Add vertical line for target patch size
             ax.axvline(args.target_patch_size, color='green', linestyle='--', linewidth=2, 
@@ -289,17 +302,25 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
             ax.axvline(dataset_avg_patch_sizes[mode_name], color='orange', linestyle=':', linewidth=2,
                       label=f'Dataset Avg: {dataset_avg_patch_sizes[mode_name]:.1f}')
             
-            ax.set_xlabel('Patch Size')
-            ax.set_ylabel('Frequency')
-            ax.set_title(f'Patch Size Distribution - {mode_name.title()} Mode\n'
-                        f'Threshold: {optimal_thresholds[mode_name]:.4f}')
-            ax.legend()
+            ax.set_xlabel('Patch Size', fontsize=18)
+            ax.set_ylabel('Frequency', fontsize=18)
+            
+            # Format title based on mode
+            if mode_name == 'absolute_entropy':
+                title = f'Patch Size Distribution - Absolute Entropy H(x_i)\nThreshold: {optimal_thresholds[mode_name]:.4f}'
+            else:
+                title = f'Patch Size Distribution - Relative Entropy H(x_i) - H(x_{{i-1}})\nThreshold: {optimal_thresholds[mode_name]:.4f}'
+            
+            ax.set_title(title, fontsize=18)
+            ax.legend(fontsize=16)
             ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=16)
         else:
-            ax.text(0.5, 0.5, f'No patches found\nfor {mode_name} mode', 
+            display_name = 'Absolute Entropy H(x_i)' if mode_name == 'absolute_entropy' else 'Relative Entropy H(x_i) - H(x_{i-1})'
+            ax.text(0.5, 0.5, f'No patches found\nfor {display_name}', 
                    transform=ax.transAxes, ha='center', va='center',
-                   bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
-            ax.set_title(f'Patch Size Distribution - {mode_name.title()} Mode')
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"), fontsize=16)
+            ax.set_title(f'Patch Size Distribution - {display_name}', fontsize=18)
     
     plt.tight_layout()
     
@@ -334,14 +355,434 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
             print(f"  {mode_name.title()} mode: No patches found")
 
 
+def create_vocabulary_distribution_plots(entropies, all_logits, args):
+    """
+    Create plots showing vocabulary probability distributions for high and low entropy points.
+    
+    Args:
+        entropies: Array of entropy values
+        all_logits: List of logits for each timestep
+        args: Command line arguments
+    """
+    import matplotlib.pyplot as plt
+    
+    # Find 3 points with lowest entropy and 3 points with highest entropy
+    entropy_indices = np.argsort(entropies)
+    low_entropy_indices = entropy_indices[:3]
+    high_entropy_indices = entropy_indices[-3:]
+    
+    # Get dataset name from CSV path
+    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
+    
+    # Create plots for low entropy points
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('Vocabulary Distributions at Low Entropy Points', fontsize=22)
+    
+    for i, idx in enumerate(low_entropy_indices):
+        logits = all_logits[idx]
+        probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+        
+        # Find peak and plot 100 values around it
+        peak_idx = np.argmax(probs)
+        start_idx = max(0, peak_idx - 50)
+        end_idx = min(len(probs), peak_idx + 50)
+        
+        x_range = np.arange(start_idx, end_idx)
+        y_values = probs[start_idx:end_idx]
+        
+        axes[i].bar(x_range, y_values, alpha=0.7, color='blue')
+        axes[i].set_title(f'Point {idx}: Entropy = {entropies[idx]:.3f}', fontsize=18)
+        axes[i].set_xlabel('Vocabulary Index', fontsize=18)
+        axes[i].set_ylabel('Probability', fontsize=18)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].tick_params(labelsize=16)
+        
+        # Mark the peak
+        axes[i].axvline(x=peak_idx, color='red', linestyle='--', alpha=0.8, label=f'Peak at {peak_idx}')
+        axes[i].legend(fontsize=16)
+    
+    plt.tight_layout()
+    
+    # Save low entropy plot
+    low_entropy_path_png = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_low_entropy.png"
+    low_entropy_path_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_low_entropy.pdf"
+    os.makedirs(os.path.dirname(low_entropy_path_png), exist_ok=True)
+    plt.savefig(low_entropy_path_png, dpi=600, bbox_inches='tight')
+    plt.savefig(low_entropy_path_pdf, bbox_inches='tight')
+    plt.close()
+    
+    # Create plots for high entropy points
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle('Vocabulary Distributions at High Entropy Points', fontsize=22)
+    
+    for i, idx in enumerate(high_entropy_indices):
+        logits = all_logits[idx]
+        probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+        
+        # Find peak and plot 100 values around it
+        peak_idx = np.argmax(probs)
+        start_idx = max(0, peak_idx - 50)
+        end_idx = min(len(probs), peak_idx + 50)
+        
+        x_range = np.arange(start_idx, end_idx)
+        y_values = probs[start_idx:end_idx]
+        
+        axes[i].bar(x_range, y_values, alpha=0.7, color='red')
+        axes[i].set_title(f'Point {idx}: Entropy = {entropies[idx]:.3f}', fontsize=18)
+        axes[i].set_xlabel('Vocabulary Index', fontsize=18)
+        axes[i].set_ylabel('Probability', fontsize=18)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].tick_params(labelsize=16)
+        
+        # Mark the peak
+        axes[i].axvline(x=peak_idx, color='blue', linestyle='--', alpha=0.8, label=f'Peak at {peak_idx}')
+        axes[i].legend(fontsize=16)
+    
+    plt.tight_layout()
+    
+    # Save high entropy plot
+    high_entropy_path_png = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_high_entropy.png"
+    high_entropy_path_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_high_entropy.pdf"
+    plt.savefig(high_entropy_path_png, dpi=600, bbox_inches='tight')
+    plt.savefig(high_entropy_path_pdf, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Vocabulary distribution plots saved:")
+    print(f"  Low entropy: {low_entropy_path_png} and {low_entropy_path_pdf}")
+    print(f"  High entropy: {high_entropy_path_png} and {high_entropy_path_pdf}")
+
+
+def create_multi_resolution_plots(all_ground_truths, all_predictions, all_entropies, 
+                                all_patch_boundaries, all_thresholds, optimal_thresholds, 
+                                dataset_avg_patch_sizes, args, results_dir):
+    """
+    Create plots at multiple resolutions (1/4, 1/2, full context) for each chunk.
+    """
+    import matplotlib.pyplot as plt
+    
+    modes = {'absolute_entropy': False, 'relative_entropy': True}
+    resolutions = [('quarter', 0.25), ('half', 0.5), ('full', 1.0)]
+    
+    for chunk_idx in range(3):
+        for res_name, res_fraction in resolutions:
+            end_point = int(args.context_length * res_fraction)
+            
+            # Create figure with 2 subplots stacked vertically
+            fig, (ax_abs, ax_rel) = plt.subplots(2, 1, figsize=(16, 12))
+            axes = {'absolute_entropy': ax_abs, 'relative_entropy': ax_rel}
+            
+            # Calculate y-axis limits for this resolution
+            all_values = []
+            all_values.extend(all_ground_truths[chunk_idx][:end_point])
+            all_values.extend(all_predictions[chunk_idx][:end_point])
+            left_y_min, left_y_max = min(all_values), max(all_values)
+            left_y_range = left_y_max - left_y_min
+            left_y_margin = max(left_y_range * 0.1, 0.01)
+            left_y_limits = (left_y_min - left_y_margin, left_y_max + left_y_margin)
+            
+            # Calculate right axis limits
+            all_entropy_values = []
+            all_threshold_values = []
+            for mode_name, is_relative in modes.items():
+                if is_relative:
+                    entropy_diff = np.diff(all_entropies[chunk_idx][:end_point])
+                    all_entropy_values.extend(entropy_diff)
+                else:
+                    all_entropy_values.extend(all_entropies[chunk_idx][:end_point])
+                all_threshold_values.append(all_thresholds[mode_name][chunk_idx])
+            
+            right_y_min = min(min(all_entropy_values), min(all_threshold_values))
+            right_y_max = max(max(all_entropy_values), max(all_threshold_values))
+            right_y_range = right_y_max - right_y_min
+            right_y_margin = max(right_y_range * 0.1, 0.01)
+            right_y_limits = (right_y_min - right_y_margin, right_y_max + right_y_margin)
+            
+            for mode_name, is_relative in modes.items():
+                ax = axes[mode_name]
+                ax_twin = ax.twinx()
+                
+                # Plot ground truth and predictions (limited to resolution)
+                ax.plot(all_ground_truths[chunk_idx][:end_point], label="Ground Truth", 
+                       linestyle='-', linewidth=2, alpha=0.8, color='blue')
+                ax.plot(all_predictions[chunk_idx][:end_point], label="Autoregressive Predictions", 
+                       linestyle='--', linewidth=2, alpha=0.8, color='green')
+                
+                # Plot entropy or entropy difference based on mode
+                if is_relative:
+                    entropy_diff = np.diff(all_entropies[chunk_idx][:end_point])
+                    ax_twin.plot(range(1, len(entropy_diff) + 1), entropy_diff, 
+                               label="Relative Entropy", color='red', linewidth=1.5, alpha=0.7)
+                else:
+                    ax_twin.plot(all_entropies[chunk_idx][:end_point], label="Absolute Entropy", 
+                               color='red', linewidth=1.5, alpha=0.7)
+                
+                # Plot threshold
+                threshold_val = all_thresholds[mode_name][chunk_idx]
+                if is_relative:
+                    ax_twin.axhline(y=threshold_val, color='orange', linestyle=':', 
+                                   linewidth=2, alpha=0.8, label=f'Relative Entropy Threshold ({threshold_val:.3f})')
+                else:
+                    ax_twin.axhline(y=threshold_val, color='orange', linestyle=':', 
+                                   linewidth=2, alpha=0.8, label=f'Absolute Entropy Threshold ({threshold_val:.3f})')
+                
+                # Plot patch boundaries (only those within the resolution range)
+                patch_boundaries = all_patch_boundaries[mode_name][chunk_idx]
+                boundaries_in_range = [b for b in patch_boundaries if b <= end_point]
+                for boundary in boundaries_in_range:
+                    ax.axvline(x=boundary, color='purple', linestyle=':', 
+                              linewidth=2, alpha=0.6)
+                
+                # Add patch boundary legend entry
+                if boundaries_in_range:
+                    ax.axvline(x=-1, color='purple', linestyle=':', linewidth=2, 
+                              alpha=0.6, label='Patch Boundaries')
+                
+                # Calculate patch statistics for this resolution
+                patches_in_range = 0
+                for i in range(len(boundaries_in_range) - 1):
+                    if boundaries_in_range[i+1] <= end_point:
+                        patches_in_range += 1
+                avg_patch_size_res = end_point / patches_in_range if patches_in_range > 0 else end_point
+                
+                # Set labels and title
+                if optimal_thresholds[mode_name] is not None:
+                    dataset_avg = dataset_avg_patch_sizes[mode_name]
+                    mode_str = f"Target {args.target_patch_size}, Dataset Avg {dataset_avg:.1f}, {res_name.title()} Avg {avg_patch_size_res:.1f}"
+                else:
+                    mode_str = f"{res_name.title()} Avg {avg_patch_size_res:.1f}"
+                
+                # Format title and labels based on mode
+                if mode_name == 'absolute_entropy':
+                    mode_display = "Absolute Entropy H(x_i)"
+                    y_label = "$H(x_i)$ (bits)"
+                else:
+                    mode_display = "Relative Entropy H(x_i) - H(x_{i-1})"
+                    y_label = "$H(x_i) - H(x_{i-1})$ (bits)"
+                
+                ax.set_title(f"{mode_display} ({mode_str}) - {patches_in_range} patches", fontsize=18)
+                ax.set_xlabel("Sample Index", fontsize=18)
+                ax.set_ylabel("Value", color='black', fontsize=18)
+                
+                ax_twin.set_ylabel(y_label, color='red', fontsize=18)
+                ax_twin.tick_params(axis='y', labelcolor='red', labelsize=16)
+                ax.tick_params(labelsize=16)
+                
+                # Set consistent y-axis limits
+                ax.set_ylim(left_y_limits)
+                ax_twin.set_ylim(right_y_limits)
+                
+                # Add legends
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax_twin.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=14)
+                ax.grid(True, alpha=0.3)
+            
+            # Set overall figure title
+            fig.suptitle(f"Chunk {chunk_idx+1} - {res_name.title()} Resolution ({end_point} points)", fontsize=20, y=0.98)
+            
+            plt.tight_layout()
+            
+            # Save plots
+            plot_path_pdf = os.path.join(results_dir, f"chunk_{chunk_idx+1}_{res_name}_resolution.pdf")
+            plot_path_png = os.path.join(results_dir, f"chunk_{chunk_idx+1}_{res_name}_resolution.png")
+            plt.savefig(plot_path_pdf, format='pdf', bbox_inches='tight', dpi=300)
+            plt.savefig(plot_path_png, format='png', dpi=600, bbox_inches='tight')
+            print(f"Chunk {chunk_idx+1} {res_name} resolution plot saved to: {plot_path_pdf} and {plot_path_png}")
+            plt.close()
+
+
+def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds, dataset_avg_patch_sizes, args):
+    """
+    Create plots showing the entire dataset with entropy and patch boundaries.
+    Creates two versions: one with the signal overlapped, one without.
+    
+    Args:
+        series: The full time series data
+        entropies: Array of entropy values for the dataset
+        all_logits: List of logits for each timestep
+        optimal_thresholds: Dict with optimal thresholds for both modes
+        dataset_avg_patch_sizes: Dict with average patch sizes for both modes
+        args: Command line arguments
+    """
+    import matplotlib.pyplot as plt
+    
+    # Get dataset name from CSV path
+    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
+    
+    modes = {'absolute_entropy': False, 'relative_entropy': True}
+    
+    # Determine how much of the dataset we have entropy data for
+    entropy_length = len(entropies)
+    series_length = len(series)
+    
+    print(f"  Full dataset length: {series_length}, Entropy data length: {entropy_length}")
+    
+    # Create plot WITH signal overlay
+    fig, axes = plt.subplots(2, 1, figsize=(20, 12))
+    
+    for i, (mode_name, is_relative) in enumerate(modes.items()):
+        ax = axes[i]
+        ax_twin = ax.twinx()
+        
+        # Plot the FULL time series signal
+        ax.plot(series, label="Time Series Signal", linestyle='-', linewidth=1.5, alpha=0.8, color='blue')
+        
+        # Plot entropy or entropy difference based on mode (only for the portion we have data)
+        if is_relative:
+            entropy_diff = np.diff(entropies)
+            ax_twin.plot(range(1, len(entropy_diff) + 1), entropy_diff, 
+                        label="Relative Entropy $H(x_i) - H(x_{i-1})$", color='red', linewidth=1, alpha=0.7)
+            y_label = "$H(x_i) - H(x_{i-1})$ (bits)"
+        else:
+            ax_twin.plot(range(len(entropies)), entropies, label="Absolute Entropy $H(x_i)$", 
+                        color='red', linewidth=1, alpha=0.7)
+            y_label = "$H(x_i)$ (bits)"
+        
+        # Plot threshold if available
+        if optimal_thresholds[mode_name] is not None:
+            threshold_val = optimal_thresholds[mode_name]
+            ax_twin.axhline(y=threshold_val, color='orange', linestyle=':', 
+                           linewidth=2, alpha=0.8, label=f'Threshold ({threshold_val:.3f})')
+            
+            # Detect and plot patch boundaries
+            patch_boundaries, _ = detect_patches_from_entropy(
+                entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size,
+                relative_entropy_mode=is_relative, fixed_threshold=threshold_val
+            )
+            
+            # Plot patch boundaries
+            for boundary in patch_boundaries[1:-1]:  # Skip first and last
+                ax.axvline(x=boundary, color='purple', linestyle=':', linewidth=1.5, alpha=0.6)
+            
+            # Add patch boundary legend entry
+            if len(patch_boundaries) > 2:
+                ax.axvline(x=-1, color='purple', linestyle=':', linewidth=1.5, 
+                          alpha=0.6, label='Patch Boundaries')
+            
+            patch_count = len(patch_boundaries) - 1
+            avg_patch_size = len(entropies) / patch_count if patch_count > 0 else len(entropies)
+            
+            mode_display = "Absolute Entropy" if mode_name == 'absolute_entropy' else "Relative Entropy"
+            title = f"{mode_display} with Signal Overlay\nPatches: {patch_count}, Avg Size: {avg_patch_size:.1f}, Target: {args.target_patch_size}"
+        else:
+            mode_display = "Absolute Entropy" if mode_name == 'absolute_entropy' else "Relative Entropy"
+            title = f"{mode_display} with Signal Overlay"
+        
+        # Set labels and formatting
+        ax.set_title(title, fontsize=18)
+        ax.set_xlabel("Sample Index", fontsize=16)
+        ax.set_ylabel("Signal Value", color='blue', fontsize=16)
+        ax_twin.set_ylabel(y_label, color='red', fontsize=16)
+        
+        # Set tick label sizes
+        ax.tick_params(axis='y', labelcolor='blue', labelsize=14)
+        ax_twin.tick_params(axis='y', labelcolor='red', labelsize=14)
+        ax.tick_params(axis='x', labelsize=14)
+        
+        # Add legends
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_twin.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=12)
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot with signal overlay
+    with_signal_png = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_with_signal.png"
+    with_signal_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_with_signal.pdf"
+    os.makedirs(os.path.dirname(with_signal_png), exist_ok=True)
+    plt.savefig(with_signal_png, dpi=600, bbox_inches='tight')
+    plt.savefig(with_signal_pdf, bbox_inches='tight')
+    plt.close()
+    
+    # Create plot WITHOUT signal overlay (entropy only)
+    fig, axes = plt.subplots(2, 1, figsize=(20, 10))
+    
+    for i, (mode_name, is_relative) in enumerate(modes.items()):
+        ax = axes[i]
+        
+        # Plot entropy or entropy difference based on mode
+        if is_relative:
+            entropy_diff = np.diff(entropies)
+            ax.plot(range(1, len(entropy_diff) + 1), entropy_diff, 
+                   label="Relative Entropy $H(x_i) - H(x_{i-1})$", color='red', linewidth=1.5, alpha=0.8)
+            y_label = "$H(x_i) - H(x_{i-1})$ (bits)"
+        else:
+            ax.plot(range(len(entropies)), entropies, label="Absolute Entropy $H(x_i)$", 
+                   color='red', linewidth=1.5, alpha=0.8)
+            y_label = "$H(x_i)$ (bits)"
+        
+        # Set x-axis to span the full signal length
+        ax.set_xlim(0, series_length - 1)
+        
+        # Set x-axis to span the full signal length (not just entropy length)
+        ax.set_xlim(0, series_length - 1)
+        
+        # Plot threshold if available
+        if optimal_thresholds[mode_name] is not None:
+            threshold_val = optimal_thresholds[mode_name]
+            ax.axhline(y=threshold_val, color='orange', linestyle=':', 
+                      linewidth=2, alpha=0.8, label=f'Threshold ({threshold_val:.3f})')
+            
+            # Detect and plot patch boundaries
+            patch_boundaries, _ = detect_patches_from_entropy(
+                entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size,
+                relative_entropy_mode=is_relative, fixed_threshold=threshold_val
+            )
+            
+            # Plot patch boundaries
+            for boundary in patch_boundaries[1:-1]:  # Skip first and last
+                ax.axvline(x=boundary, color='purple', linestyle=':', linewidth=1.5, alpha=0.6)
+            
+            # Add patch boundary legend entry
+            if len(patch_boundaries) > 2:
+                ax.axvline(x=-1, color='purple', linestyle=':', linewidth=1.5, 
+                          alpha=0.6, label='Patch Boundaries')
+            
+            patch_count = len(patch_boundaries) - 1
+            avg_patch_size = len(entropies) / patch_count if patch_count > 0 else len(entropies)
+            
+            mode_display = "Absolute Entropy" if mode_name == 'absolute_entropy' else "Relative Entropy"
+            title = f"{mode_display} - Entropy Only\nPatches: {patch_count}, Avg Size: {avg_patch_size:.1f}, Target: {args.target_patch_size}"
+        else:
+            mode_display = "Absolute Entropy" if mode_name == 'absolute_entropy' else "Relative Entropy"
+            title = f"{mode_display} - Entropy Only"
+        
+        # Set labels and formatting
+        ax.set_title(title, fontsize=18)
+        ax.set_xlabel("Sample Index", fontsize=16)
+        ax.set_ylabel(y_label, color='red', fontsize=16)
+        
+        # Set tick label sizes
+        ax.tick_params(axis='y', labelcolor='red', labelsize=14)
+        ax.tick_params(axis='x', labelsize=14)
+        
+        # Add legend
+        ax.legend(loc='upper left', fontsize=12)
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save plot without signal overlay
+    without_signal_png = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_entropy_only.png"
+    without_signal_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_entropy_only.pdf"
+    plt.savefig(without_signal_png, dpi=600, bbox_inches='tight')
+    plt.savefig(without_signal_pdf, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Full dataset plots saved:")
+    print(f"  With signal overlay: {with_signal_png} and {with_signal_pdf}")
+    print(f"  Entropy only: {without_signal_png} and {without_signal_pdf}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Autoregressive prediction with entropy-based patches for 3 random chunks.')
+    parser = argparse.ArgumentParser(description='Autoregressive prediction with entropy-based patches for 3 random chunks. Creates Absolute Entropy H(x_i) and Relative Entropy H(x_i) - H(x_{i-1}) visualizations including full dataset plots.')
     parser.add_argument('--csv_path', type=str, 
                         default='../datasets/time-moe-eval/ETT-small/ETTm2.csv',
                         help='Path to the CSV file containing the time series data')
     parser.add_argument('--col_num', type=int, default=1, 
                         help='Column number (0-indexed) to process')
-    parser.add_argument('--context_length', type=int, default=256, 
+    parser.add_argument('--context_length', type=int, default=1024, 
                         help='Length of context to predict autoregressively')
     parser.add_argument('--model', type=str, default='../model_weights/chronos/chronos-t5-small',
                         help='Chronos model to use for prediction')
@@ -407,8 +848,8 @@ def main():
     random_starts = random.sample(range(max_start), 3)
 
     # If target patch size is specified, compute entropy for dataset to find optimal thresholds
-    optimal_thresholds = {'absolute': None, 'monotonic': None}
-    dataset_avg_patch_sizes = {'absolute': None, 'monotonic': None}
+    optimal_thresholds = {'absolute_entropy': None, 'relative_entropy': None}
+    dataset_avg_patch_sizes = {'absolute_entropy': None, 'relative_entropy': None}
     if args.target_patch_size is not None:
         # Determine which part of the dataset to use for threshold search
         if args.threshold_search_k is not None:
@@ -421,63 +862,74 @@ def main():
         print(f"\nComputing entropy for {search_description} to find optimal thresholds...")
         print(f"Target patch size: {args.target_patch_size}")
         
-        # Compute entropy for the search series
-        _, search_entropies = autoregressive_predict_context_simplified(
+        # Compute entropy for the search series (using sliding window approach for threshold optimization)
+        _, search_entropies, search_logits = autoregressive_predict_context_simplified(
             pipeline, search_series, dataset_mean, max_context_length=args.context_length)
-        
+
         # Find optimal thresholds for both modes
-        print("\n--- Finding optimal threshold for Absolute mode ---")
-        optimal_thresholds['absolute'], dataset_avg_patch_sizes['absolute'], abs_iterations = find_optimal_threshold(
+        print("\n--- Finding optimal threshold for Absolute Entropy mode ---")
+        optimal_thresholds['absolute_entropy'], dataset_avg_patch_sizes['absolute_entropy'], abs_iterations = find_optimal_threshold(
             search_entropies, args.target_patch_size, args.min_patch_size, 
-            monotonic_mode=False, max_iterations=args.max_iterations
+            relative_entropy_mode=False, max_iterations=args.max_iterations
         )
         
-        print("\n--- Finding optimal threshold for Monotonic mode ---")
-        optimal_thresholds['monotonic'], dataset_avg_patch_sizes['monotonic'], mon_iterations = find_optimal_threshold(
+        print("\n--- Finding optimal threshold for Relative Entropy mode ---")
+        optimal_thresholds['relative_entropy'], dataset_avg_patch_sizes['relative_entropy'], rel_iterations = find_optimal_threshold(
             search_entropies, args.target_patch_size, args.min_patch_size, 
-            monotonic_mode=True, max_iterations=args.max_iterations
+            relative_entropy_mode=True, max_iterations=args.max_iterations
         )
         
         print(f"\nOptimal thresholds found:")
-        print(f"  Absolute mode: {optimal_thresholds['absolute']:.4f} (dataset avg size: {dataset_avg_patch_sizes['absolute']:.1f})")
-        print(f"  Monotonic mode: {optimal_thresholds['monotonic']:.4f} (dataset avg size: {dataset_avg_patch_sizes['monotonic']:.1f})")
+        print(f"  Absolute Entropy mode: {optimal_thresholds['absolute_entropy']:.4f} (dataset avg size: {dataset_avg_patch_sizes['absolute_entropy']:.1f})")
+        print(f"  Relative Entropy mode: {optimal_thresholds['relative_entropy']:.4f} (dataset avg size: {dataset_avg_patch_sizes['relative_entropy']:.1f})")
         print(f"Threshold search performed on: {search_description}")
         
         # Create histogram of patch size distribution for both modes
         print("\nCreating patch size distribution histograms...")
         create_patch_size_histogram(search_entropies, optimal_thresholds, 
                                    dataset_avg_patch_sizes, args)
+        
+        # Create vocabulary distribution plots
+        print("\nCreating vocabulary distribution plots...")
+        create_vocabulary_distribution_plots(search_entropies, search_logits, args)
+        
+        # Create full dataset plots
+        print("\nCreating full dataset plots...")
+        create_full_dataset_plots(series, search_entropies, search_logits, 
+                                optimal_thresholds, dataset_avg_patch_sizes, args)
 
     # Generate autoregressive predictions for each chunk
     all_ground_truths = []
     all_predictions = []
     all_entropies = []
-    all_patch_boundaries = {'absolute': [], 'monotonic': []}
-    all_thresholds = {'absolute': [], 'monotonic': []}
+    all_logits = []
+    all_patch_boundaries = {'absolute_entropy': [], 'relative_entropy': []}
+    all_thresholds = {'absolute_entropy': [], 'relative_entropy': []}
 
     for i, start in enumerate(random_starts):
         print(f"\nProcessing chunk {i+1}/3 (start index {start})...")
         ground_truth = series[start:start+args.context_length]
-        preds, entropies = autoregressive_predict_context_simplified(
+        preds, entropies, logits = autoregressive_predict_context_simplified(
             pipeline, ground_truth, dataset_mean, max_context_length=args.context_length)
         
         # Process both modes
-        modes = {'absolute': False, 'monotonic': True}
+        modes = {'absolute_entropy': False, 'relative_entropy': True}
         
-        for mode_name, is_monotonic in modes.items():
-            print(f"\n  --- {mode_name.capitalize()} Mode ---")
+        for mode_name, is_relative in modes.items():
+            mode_display = "Absolute Entropy" if mode_name == 'absolute_entropy' else "Relative Entropy"
+            print(f"\n  --- {mode_display} Mode ---")
             
             # Detect patches based on entropy spikes
             if optimal_thresholds[mode_name] is not None:
                 # Use the optimal threshold found from full dataset analysis
                 patch_boundaries, threshold = detect_patches_from_entropy(
                     entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size, 
-                    monotonic_mode=is_monotonic, fixed_threshold=optimal_thresholds[mode_name]
+                    relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name]
                 )
             else:
                 # Use traditional threshold calculation
                 patch_boundaries, threshold = detect_patches_from_entropy(
-                    entropies, args.threshold_multiplier, args.min_patch_size, is_monotonic
+                    entropies, args.threshold_multiplier, args.min_patch_size, is_relative
                 )
             
             all_patch_boundaries[mode_name].append(patch_boundaries)
@@ -497,135 +949,18 @@ def main():
         all_ground_truths.append(ground_truth)
         all_predictions.append(preds)
         all_entropies.append(entropies)
+        all_logits.append(logits)
     # Create results directory structure
     dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
     results_dir = f"results_entropy/{dataset_name}/col_{args.col_num}"
     os.makedirs(results_dir, exist_ok=True)
     
-    # Create plots for each chunk with both modes as subplots
-    modes = {'absolute': False, 'monotonic': True}
+    print(f"\n=== Creating multi-resolution plots ===")
     
-    # Calculate global y-axis limits for consistent scaling across all plots
-    # Left axis: ground truth and predictions (same for both modes)
-    all_values = []
-    for i in range(3):
-        all_values.extend(all_ground_truths[i])
-        all_values.extend(all_predictions[i])
-    left_y_min, left_y_max = min(all_values), max(all_values)
-    left_y_range = left_y_max - left_y_min
-    left_y_margin = max(left_y_range * 0.1, 0.01)  # 10% margin, minimum 0.01
-    left_y_limits = (left_y_min - left_y_margin, left_y_max + left_y_margin)
-
-    # Calculate right axis limits - collect all entropy values and thresholds from both modes
-    all_entropy_values = []
-    all_threshold_values = []
-    
-    for mode_name, is_monotonic in modes.items():
-        for i in range(3):
-            if is_monotonic:
-                entropy_diff = np.diff(all_entropies[i])
-                all_entropy_values.extend(entropy_diff)
-            else:
-                all_entropy_values.extend(all_entropies[i])
-            all_threshold_values.append(all_thresholds[mode_name][i])
-    
-    # Use the same limits for both modes
-    right_y_min = min(min(all_entropy_values), min(all_threshold_values))
-    right_y_max = max(max(all_entropy_values), max(all_threshold_values))
-    right_y_range = right_y_max - right_y_min
-    right_y_margin = max(right_y_range * 0.1, 0.01)  # 10% margin, minimum 0.01
-    right_y_limits = (right_y_min - right_y_margin, right_y_max + right_y_margin)
-    
-    print(f"\n=== Creating combined plots with both modes ===")
-    
-    for i in range(3):
-        # Create figure with 2 subplots stacked vertically
-        fig, (ax_abs, ax_mon) = plt.subplots(2, 1, figsize=(16, 12))
-        
-        # Process both modes
-        axes = {'absolute': ax_abs, 'monotonic': ax_mon}
-        
-        for mode_name, is_monotonic in modes.items():
-            ax = axes[mode_name]
-            ax_twin = ax.twinx()
-            
-            # Plot ground truth and predictions
-            ax.plot(all_ground_truths[i], label="Ground Truth", linestyle='-', 
-                    linewidth=2, alpha=0.8, color='blue')
-            ax.plot(all_predictions[i], label="Autoregressive Predictions", linestyle='--', 
-                    linewidth=2, alpha=0.8, color='green')
-            
-            # Plot entropy or entropy difference based on mode
-            if is_monotonic:
-                entropy_diff = np.diff(all_entropies[i])
-                ax_twin.plot(range(1, len(all_entropies[i])), entropy_diff, 
-                             label="Entropy Difference", color='red', linewidth=1.5, alpha=0.7)
-            else:
-                ax_twin.plot(all_entropies[i], label="Token Entropy", 
-                             color='red', linewidth=1.5, alpha=0.7)
-            
-            # Plot threshold
-            threshold_val = all_thresholds[mode_name][i]
-            if is_monotonic:
-                ax_twin.axhline(y=threshold_val, color='orange', linestyle=':', 
-                               linewidth=2, alpha=0.8, label=f'Entropy Diff Threshold ({threshold_val:.3f})')
-            else:
-                ax_twin.axhline(y=threshold_val, color='orange', linestyle=':', 
-                               linewidth=2, alpha=0.8, label=f'Entropy Threshold ({threshold_val:.3f})')
-            
-            # Plot patch boundaries
-            patch_boundaries = all_patch_boundaries[mode_name][i]
-            for boundary in patch_boundaries:
-                ax.axvline(x=boundary, color='purple', linestyle=':', 
-                           linewidth=2, alpha=0.6)
-            
-            # Add patch boundary legend entry
-            ax.axvline(x=-1, color='purple', linestyle=':', linewidth=2, 
-                       alpha=0.6, label='Patch Boundaries')
-            
-            # Set labels and title
-            patch_count = len(patch_boundaries) - 1
-            context_avg_patch_size = args.context_length / patch_count if patch_count > 0 else args.context_length
-            
-            if optimal_thresholds[mode_name] is not None:
-                # Include both dataset-level and context-level average patch sizes
-                dataset_avg = dataset_avg_patch_sizes[mode_name]
-                mode_str = f"Target {args.target_patch_size}, Dataset Avg {dataset_avg:.1f}, Context Avg {context_avg_patch_size:.1f}"
-            else:
-                mode_str = f"Context Avg {context_avg_patch_size:.1f}"
-            
-            ax.set_title(f"{mode_name.capitalize()} Mode ({mode_str}) - {patch_count} patches", fontsize=12)
-            ax.set_xlabel("Sample Index")
-            ax.set_ylabel("Value", color='black')
-            
-            if is_monotonic:
-                ax_twin.set_ylabel("Entropy Difference (bits)", color='red')
-            else:
-                ax_twin.set_ylabel("Token Entropy (bits)", color='red')
-            ax_twin.tick_params(axis='y', labelcolor='red')
-            
-            # Set consistent y-axis limits
-            ax.set_ylim(left_y_limits)
-            ax_twin.set_ylim(right_y_limits)
-            
-            # Add legends
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax_twin.get_legend_handles_labels()
-            ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=9)
-            ax.grid(True, alpha=0.3)
-        
-        # Set overall figure title
-        fig.suptitle(f"Chunk {i+1} - Entropy-based Patch Detection Comparison", fontsize=14, y=0.98)
-        
-        plt.tight_layout()
-        
-        # Save both PDF and PNG
-        plot_path_pdf = os.path.join(results_dir, f"chunk_{i+1}_entropy_patches_combined.pdf")
-        plot_path_png = os.path.join(results_dir, f"chunk_{i+1}_entropy_patches_combined.png")
-        plt.savefig(plot_path_pdf, format='pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(plot_path_png, format='png', dpi=600, bbox_inches='tight')
-        print(f"Combined plot for chunk {i+1} saved to: {plot_path_pdf} and {plot_path_png}")
-        plt.show()
+    # Create plots at multiple resolutions for each chunk
+    create_multi_resolution_plots(all_ground_truths, all_predictions, all_entropies,
+                                all_patch_boundaries, all_thresholds, optimal_thresholds,
+                                dataset_avg_patch_sizes, args, results_dir)
 
     # Calculate and print metrics for both modes
     has_optimal = any(optimal_thresholds[mode] is not None for mode in optimal_thresholds)
@@ -637,8 +972,9 @@ def main():
     
     print(f"\n=== PREDICTION METRICS ({threshold_method}) ===")
     
-    for mode_name in ['absolute', 'monotonic']:
-        print(f"\n--- {mode_name.upper()} MODE ---")
+    for mode_name in ['absolute_entropy', 'relative_entropy']:
+        mode_display = "ABSOLUTE ENTROPY" if mode_name == 'absolute_entropy' else "RELATIVE ENTROPY"
+        print(f"\n--- {mode_display} MODE ---")
         
         for i in range(3):
             mae = np.mean(np.abs(all_ground_truths[i] - all_predictions[i]))

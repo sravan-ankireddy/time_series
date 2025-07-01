@@ -104,6 +104,7 @@ if __name__ == '__main__':
 
     unique_job_name = args.main_file + argv
     os.environ['MASTER_PORT'] = str(args.port)
+    os.environ['LOCAL_WORLD_SIZE'] = '2'
 
     auto_dist_run(
         main_file=args.main_file,

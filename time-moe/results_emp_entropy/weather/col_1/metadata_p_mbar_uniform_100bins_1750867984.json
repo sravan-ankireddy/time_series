@@ -1,0 +1,15 @@
+{
+  "dataset_name": "weather",
+  "column_number": 1,
+  "column_name": "p (mbar)",
+  "n_points": 52696,
+  "n_bins": 100,
+  "strategy": "uniform",
+  "entropy_stats": {
+    "mean": 5.816244804211716,
+    "std": 1.1383530854613002,
+    "min": 4.810424487132367,
+    "max": 12.685405834786142
+  },
+  "timestamp": 1750867984
+}

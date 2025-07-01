@@ -1,0 +1,57 @@
+### patching
+
+
+python create_entropy_based_patches.py --csv_path ./datasets/entropy_signal.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+
+python create_entropy_based_patches.py --csv_path ./datasets/ETT-small/ETTm2.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+
+python create_entropy_based_patches.py --csv_path ./datasets/electricity.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+
+
+
+
+### debug 
+
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 1024 --global_batch_size 1024 --micro_batch_size 2 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+python main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 1024 --global_batch_size 1024 --micro_batch_size 2 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+## training 
+
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_linear_1_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 108 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_linear_1_p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+## TACC commands 
+
+python torch_dist_run_tacc.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" --attn_implementation flash_attention_2 -o logs_linear_1_p4_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+python torch_dist_run_tacc.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" --attn_implementation flash_attention_2 -o logs_linear_1_p8_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 128 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+python torch_dist_run_tacc.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" --attn_implementation flash_attention_2 -o logs_linear_1_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+python torch_dist_run_tacc.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" --attn_implementation flash_attention_2 -o logs_linear_1p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 192 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_vista/linear_1_p8_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 384 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_vista/linear_1_p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+## entropy patching 
+
+python create_var_patches.py --csv_path ./datasets/synthetic_sinusoidal.csv --column 4 --bins 16
+
+python create_var_patches.py --csv_path ./datasets/ETT-small/ETTm2.csv --column 1 --bins 32 --use_global
+
+python create_var_patches.py --csv_path ./datasets/electricity.csv --column 1 --bins 32 --use_global
+
+
+python create_var_patches.py --csv_path ./datasets/ETT-small/ETTm2.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+
+python create_var_patches.py --csv_path ./datasets/synthetic_sinusoidal.csv --column 5 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+
+
+

@@ -47,7 +47,7 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
 
 
 def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_size=5, 
-                               monotonic_mode=False):
+                               monotonic_mode=False, fixed_threshold=None):
     """
     Detect patch boundaries based on entropy spikes.
     
@@ -56,12 +56,17 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
         threshold_multiplier: Multiplier for mean entropy to determine spike threshold
         min_patch_size: Minimum size of a patch
         monotonic_mode: If True, use Approximate Monotonic Constraint (diff-based)
+        fixed_threshold: If not None, use this fixed threshold instead of calculating one
     
     Returns:
         patch_boundaries: List of patch boundary indices
         threshold: The threshold value used for spike detection
     """
-    if monotonic_mode:
+    if fixed_threshold is not None:
+        # Use the fixed threshold provided
+        threshold = fixed_threshold
+        spikes = np.where(entropies > threshold)[0]
+    elif monotonic_mode:
         # Approximate Monotonic Constraint: use differences between consecutive entropy values
         entropy_diffs = np.diff(entropies)
         # Only consider positive differences (increases in entropy)
@@ -108,7 +113,98 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
     return patch_boundaries, threshold
 
 
-
+def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, monotonic_mode=False, max_iterations=10):
+    """
+    Find the optimal threshold that produces patches with the target average size.
+    
+    Args:
+        entropies: Array of entropy values for the entire dataset
+        target_patch_size: Desired average patch size
+        min_patch_size: Minimum size of a patch
+        monotonic_mode: If True, use Approximate Monotonic Constraint (diff-based)
+        max_iterations: Maximum number of iterations to find optimal threshold
+    
+    Returns:
+        optimal_threshold: The threshold that produces patches closest to target size
+        final_avg_patch_size: The actual average patch size achieved
+        iterations_used: Number of iterations used
+    """
+    print(f"\nFinding optimal threshold for target patch size: {target_patch_size}")
+    
+    # Initial threshold estimate using standard method
+    if monotonic_mode:
+        entropy_diffs = np.diff(entropies)
+        positive_diffs = entropy_diffs[entropy_diffs > 0]
+        if len(positive_diffs) > 0:
+            initial_threshold = np.mean(positive_diffs) + 1.5 * np.std(positive_diffs)
+        else:
+            initial_threshold = 0
+    else:
+        initial_threshold = np.mean(entropies) + 1.5 * np.std(entropies)
+    
+    # Binary search bounds
+    threshold_low = 0.0
+    threshold_high = initial_threshold * 3  # Start with a wide range
+    current_threshold = initial_threshold
+    
+    best_threshold = current_threshold
+    best_diff = float('inf')
+    
+    for iteration in range(max_iterations):
+        # Test current threshold
+        patch_boundaries, _ = detect_patches_from_entropy(
+            entropies, threshold_multiplier=None, min_patch_size=min_patch_size, 
+            monotonic_mode=monotonic_mode, fixed_threshold=current_threshold
+        )
+        
+        num_patches = len(patch_boundaries) - 1
+        if num_patches > 0:
+            current_avg_patch_size = len(entropies) / num_patches
+        else:
+            current_avg_patch_size = len(entropies)
+        
+        diff_from_target = abs(current_avg_patch_size - target_patch_size)
+        
+        print(f"  Iteration {iteration + 1}: threshold={current_threshold:.4f}, "
+              f"avg_patch_size={current_avg_patch_size:.1f}, diff={diff_from_target:.1f}")
+        
+        # Check if we found a better threshold
+        if diff_from_target < best_diff:
+            best_threshold = current_threshold
+            best_diff = diff_from_target
+        
+        # Check if we're within tolerance
+        if diff_from_target <= 1.0:
+            print(f"  Found optimal threshold: {current_threshold:.4f} "
+                  f"(avg patch size: {current_avg_patch_size:.1f})")
+            return current_threshold, current_avg_patch_size, iteration + 1
+        
+        # Adjust threshold using binary search
+        if current_avg_patch_size > target_patch_size:
+            # Patches too large, need higher threshold (more boundaries)
+            threshold_low = current_threshold
+            current_threshold = (current_threshold + threshold_high) / 2
+        else:
+            # Patches too small, need lower threshold (fewer boundaries)
+            threshold_high = current_threshold
+            current_threshold = (threshold_low + current_threshold) / 2
+        
+        # Prevent infinite loops with very small ranges
+        if abs(threshold_high - threshold_low) < 1e-6:
+            break
+    
+    # Return best threshold found
+    patch_boundaries, _ = detect_patches_from_entropy(
+        entropies, threshold_multiplier=None, min_patch_size=min_patch_size,
+        monotonic_mode=monotonic_mode, fixed_threshold=best_threshold
+    )
+    num_patches = len(patch_boundaries) - 1
+    final_avg_patch_size = len(entropies) / num_patches if num_patches > 0 else len(entropies)
+    
+    print(f"  Best threshold found: {best_threshold:.4f} "
+          f"(avg patch size: {final_avg_patch_size:.1f}, diff: {best_diff:.1f})")
+    
+    return best_threshold, final_avg_patch_size, max_iterations
 
 
 def main():
@@ -123,7 +219,11 @@ def main():
     parser.add_argument('--model', type=str, default='amazon/chronos-t5-small',
                         help='Chronos model to use for prediction')
     parser.add_argument('--threshold_multiplier', type=float, default=1.5,
-                        help='Multiplier for mean+std to determine spike threshold')
+                        help='Multiplier for mean+std to determine spike threshold (ignored if target_patch_size is set)')
+    parser.add_argument('--target_patch_size', type=int, default=8,
+                        help='Target average patch size. If set, will automatically find optimal threshold.')
+    parser.add_argument('--threshold_search_k', type=int, default=None,
+                        help='Number of samples to use for threshold search. If not set, uses entire dataset.')
     parser.add_argument('--min_patch_size', type=int, default=1,
                         help='Minimum size of a patch')
     parser.add_argument('--monotonic_mode', action='store_true',
@@ -137,6 +237,15 @@ def main():
     if args.col_num >= len(df.columns):
         raise ValueError(f"Column number {args.col_num} is out of range for the CSV file")
     series = df.iloc[:, args.col_num].values
+
+    # Validate threshold_search_k argument
+    if args.threshold_search_k is not None:
+        if args.threshold_search_k <= 0:
+            raise ValueError("threshold_search_k must be positive")
+        if args.threshold_search_k > len(series):
+            raise ValueError(f"threshold_search_k ({args.threshold_search_k}) cannot be larger than dataset size ({len(series)})")
+        if args.target_patch_size is None:
+            print("Warning: threshold_search_k specified but target_patch_size not set. threshold_search_k will be ignored.")
 
     # Calculate dataset mean
     dataset_mean = np.mean(series)
@@ -157,6 +266,35 @@ def main():
         raise ValueError(f"Time series too short for 3 chunks of length {args.context_length}")
     random_starts = random.sample(range(max_start), 3)
 
+    # If target patch size is specified, compute entropy for dataset to find optimal threshold
+    optimal_threshold = None
+    if args.target_patch_size is not None:
+        # Determine which part of the dataset to use for threshold search
+        if args.threshold_search_k is not None:
+            search_series = series[:args.threshold_search_k]
+            search_description = f"first {args.threshold_search_k} samples"
+        else:
+            search_series = series
+            search_description = "entire dataset"
+            
+        print(f"\nComputing entropy for {search_description} to find optimal threshold...")
+        print(f"Target patch size: {args.target_patch_size}")
+        
+        # Compute entropy for the search series
+        _, search_entropies = autoregressive_predict_context_simplified(
+            pipeline, search_series, dataset_mean)
+        
+        # Find optimal threshold based on target patch size
+        optimal_threshold, actual_avg_size, iterations = find_optimal_threshold(
+            search_entropies, args.target_patch_size, args.min_patch_size, 
+            args.monotonic_mode, max_iterations=1000
+        )
+        
+        print(f"Optimal threshold found: {optimal_threshold:.4f}")
+        print(f"Achieved average patch size: {actual_avg_size:.1f}")
+        print(f"Iterations used: {iterations}")
+        print(f"Threshold search performed on: {search_description}")
+
     # Generate autoregressive predictions for each chunk
     all_ground_truths = []
     all_predictions = []
@@ -171,9 +309,17 @@ def main():
             pipeline, ground_truth, dataset_mean)
         
         # Detect patches based on entropy spikes
-        patch_boundaries, threshold = detect_patches_from_entropy(
-            entropies, args.threshold_multiplier, args.min_patch_size, args.monotonic_mode
-        )
+        if optimal_threshold is not None:
+            # Use the optimal threshold found from full dataset analysis
+            patch_boundaries, threshold = detect_patches_from_entropy(
+                entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size, 
+                monotonic_mode=args.monotonic_mode, fixed_threshold=optimal_threshold
+            )
+        else:
+            # Use traditional threshold calculation
+            patch_boundaries, threshold = detect_patches_from_entropy(
+                entropies, args.threshold_multiplier, args.min_patch_size, args.monotonic_mode
+            )
         
         all_ground_truths.append(ground_truth)
         all_predictions.append(preds)
@@ -181,8 +327,15 @@ def main():
         all_patch_boundaries.append(patch_boundaries)
         all_thresholds.append(threshold)
         
-        print(f"  Entropy-based patches: {len(patch_boundaries)-1} with threshold {threshold:.4f}")
-        print(f"  Mode: {'Monotonic (entropy diff)' if args.monotonic_mode else 'Absolute entropy'}")
+        patch_count = len(patch_boundaries) - 1
+        avg_chunk_patch_size = args.context_length / patch_count if patch_count > 0 else args.context_length
+        
+        if optimal_threshold is not None:
+            print(f"  Entropy-based patches: {patch_count} with optimal threshold {threshold:.4f}")
+            print(f"  Chunk avg patch size: {avg_chunk_patch_size:.1f} (target: {args.target_patch_size})")
+        else:
+            print(f"  Entropy-based patches: {patch_count} with threshold {threshold:.4f}")
+            print(f"  Mode: {'Monotonic (entropy diff)' if args.monotonic_mode else 'Absolute entropy'}")
         print(f"  Patch boundaries: {patch_boundaries}")
 
     # Create results directory structure
@@ -226,7 +379,11 @@ def main():
         
         # Set labels and title
         patch_count = len(all_patch_boundaries[i]) - 1
-        mode_str = "Monotonic Entropy-Diff" if args.monotonic_mode else "Absolute Entropy"
+        if optimal_threshold is not None:
+            search_info = f"k={args.threshold_search_k}" if args.threshold_search_k is not None else "full dataset"
+            mode_str = f"Optimal Threshold (target: {args.target_patch_size}, search: {search_info})"
+        else:
+            mode_str = "Monotonic Entropy-Diff" if args.monotonic_mode else "Absolute Entropy"
         ax.set_title(f"Chunk {i+1} - Entropy-based Patches ({mode_str}) - {patch_count} patches")
         ax.set_xlabel("Sample Index")
         ax.set_ylabel("Value", color='black')
@@ -247,7 +404,13 @@ def main():
         plt.show()
 
     # Calculate and print metrics
-    print(f"\nPrediction Metrics ({'Monotonic Mode' if args.monotonic_mode else 'Absolute Mode'}):")
+    if optimal_threshold is not None:
+        search_info = f"k={args.threshold_search_k}" if args.threshold_search_k is not None else "full dataset"
+        threshold_method = f"Optimal (target: {args.target_patch_size}, search: {search_info})"
+    else:
+        threshold_method = 'Monotonic Mode' if args.monotonic_mode else 'Absolute Mode'
+    print(f"\nPrediction Metrics ({threshold_method}):")
+    
     for i in range(3):
         mae = np.mean(np.abs(all_ground_truths[i] - all_predictions[i]))
         mse = np.mean((all_ground_truths[i] - all_predictions[i]) ** 2)

@@ -169,46 +169,106 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+class PatchingTransformer(nn.Module):
+    """Small transformer for intelligent patching operations."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        
+        # Ensure num_heads is valid (must divide input_dim)
+        self.num_heads = 1
+        
+        # Multi-head attention for patch aggregation
+        self.attention = nn.MultiheadAttention(
+            embed_dim=input_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # Layer norm and feed-forward
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        
+        # Final projection to hidden size
+        self.output_proj = nn.Linear(input_dim, hidden_dim)
+    
+    def forward(self, x):
+        # x shape: [batch_size, patch_size, input_size]
+        # Apply self-attention within patch
+        residual = x
+        x = self.norm1(x)
+        attn_out, _ = self.attention(x, x, x)
+        x = residual + attn_out
+        
+        # Feed-forward
+        residual = x
+        x = self.norm2(x)
+        ff_out = self.feed_forward(x)
+        x = residual + ff_out
+        
+        # Aggregate patch information (mean pooling)
+        patch_embedding = torch.mean(x, dim=1)  # [batch_size, input_size]
+        
+        # Project to hidden dimension
+        output = self.output_proj(patch_embedding)  # [batch_size, hidden_dim]
+        
+        return output
+
+
 class TimeMoeInputEmbedding(nn.Module):
     """
-    Use a mlp layer to embedding the time-series with patching support.
+    Use transformer-based patching to embedding the time-series.
     """
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.config = config
         self.input_size = config.input_size  # default 1
+        self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.patch_size = getattr(config, 'patch_size', 1)  # default 1 (no patching)
         
-        # Project entire patch to hidden dimension
-        patch_input_size = self.input_size * self.patch_size
-        self.emb_layer = nn.Linear(patch_input_size, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(patch_input_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        # Transformer-based patching module
+        self.patching_transformer = PatchingTransformer(
+            input_dim=self.input_size,
+            hidden_dim=self.hidden_size,
+            num_heads=min(4, self.input_size)  # Ensure num_heads <= input_size
+        )
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, input_size]
         batch_size, seq_len, input_size = x.shape
         
-        if self.patch_size > 1:
-            # Calculate number of complete patches
-            num_patches = seq_len // self.patch_size
-            
-            # Ensure we have at least one complete patch
-            if num_patches == 0:
-                raise ValueError(f"Input sequence length {seq_len} is smaller than patch_size {self.patch_size}")
-            
-            # Trim sequence to multiple of patch_size
-            trimmed_len = num_patches * self.patch_size
-            x = x[:, :trimmed_len, :]
-            
-            # Reshape into patches: [batch_size, num_patches, patch_size * input_size]
-            x = x.view(batch_size, num_patches, self.patch_size * input_size)
+        # Create patches: group patch_size consecutive samples
+        # Pad sequence if necessary
+        if seq_len % self.patch_size != 0:
+            pad_len = self.patch_size - (seq_len % self.patch_size)
+            x = F.pad(x, (0, 0, 0, pad_len), mode='constant', value=0)
+            seq_len = x.shape[1]
         
-        # Apply gated MLP embedding
-        emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
-        return emb
+        # Reshape to patches: [batch_size, num_patches, patch_size, input_size]
+        num_patches = seq_len // self.patch_size
+        x_patches = x.view(batch_size, num_patches, self.patch_size, input_size)
+        
+        # Reshape for efficient batch processing: [batch_size * num_patches, patch_size, input_size]
+        x_patches_flat = x_patches.view(batch_size * num_patches, self.patch_size, input_size)
+        
+        # Apply transformer-based patching to all patches at once
+        patch_embeddings_flat = self.patching_transformer(x_patches_flat)  # [batch_size * num_patches, hidden_size]
+        
+        # Reshape back: [batch_size, num_patches, hidden_size]
+        embeddings = patch_embeddings_flat.view(batch_size, num_patches, self.hidden_size)
+        
+        return embeddings
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -799,32 +859,6 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def _convert_attention_mask_to_patches(self, attention_mask, patch_size):
-        """
-        Convert point-level attention mask to patch-level attention mask.
-        A patch is considered valid if all points within it are valid.
-        
-        Args:
-            attention_mask: [batch_size, seq_len] - point level mask
-            patch_size: int - number of points per patch
-            
-        Returns:
-            patch_attention_mask: [batch_size, num_patches] - patch level mask
-        """
-        if attention_mask is None or patch_size <= 1:
-            return attention_mask
-            
-        batch_size, seq_len = attention_mask.shape
-        num_patches = seq_len // patch_size
-        trimmed_len = num_patches * patch_size
-        
-        # Trim to multiple of patch_size
-        trimmed_mask = attention_mask[:, :trimmed_len]
-        
-        # Reshape to patches and check if all points in each patch are valid
-        patch_mask = trimmed_mask.view(batch_size, num_patches, patch_size)
-        return patch_mask.all(dim=-1).float()
-
     def forward(
             self,
             input_ids: torch.FloatTensor = None,
@@ -852,13 +886,12 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         elif input_ids is not None:
             if len(input_ids.shape) == 2:
                 input_ids.unsqueeze_(dim=-1)
-            batch_size, seq_length, _ = input_ids.shape
-            
-            # Calculate patched sequence length
-            patch_size = getattr(self.config, 'patch_size', 1)
-            patched_seq_length = seq_length // patch_size
+            batch_size, orig_seq_length, _ = input_ids.shape
+            # After patching, sequence length becomes orig_seq_length // patch_size (with padding if needed)
+            padded_seq_length = orig_seq_length if orig_seq_length % self.embed_layer.patch_size == 0 else orig_seq_length + (self.embed_layer.patch_size - orig_seq_length % self.embed_layer.patch_size)
+            seq_length = padded_seq_length // self.embed_layer.patch_size
         elif inputs_embeds is not None:
-            batch_size, patched_seq_length, _ = inputs_embeds.shape
+            batch_size, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
@@ -875,38 +908,25 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(patched_seq_length)
+            past_key_values_length = past_key_values.get_usable_length(seq_length)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_key_values_length, patched_seq_length + past_key_values_length, dtype=torch.long, device=device
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            position_ids = position_ids.view(-1, seq_length)
         else:
-            position_ids = position_ids.view(batch_size, -1).long()
-            # Truncate or pad position_ids to match sequence length
-            if position_ids.shape[1] > patched_seq_length:
-                position_ids = position_ids[:, :patched_seq_length]
-            elif position_ids.shape[1] < patched_seq_length:
-                # Pad with continuation
-                last_pos = position_ids[:, -1:] if position_ids.shape[1] > 0 else torch.zeros((batch_size, 1), device=position_ids.device, dtype=position_ids.dtype)
-                padding_length = patched_seq_length - position_ids.shape[1]
-                padding = last_pos + torch.arange(1, padding_length + 1, device=position_ids.device, dtype=position_ids.dtype).unsqueeze(0)
-                position_ids = torch.cat([position_ids, padding], dim=1)
+            position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_layer(input_ids)
 
-        # Handle attention mask for patched sequences
-        patch_size = getattr(self.config, 'patch_size', 1)
-        if attention_mask is not None and patch_size > 1:
-            attention_mask = self._convert_attention_mask_to_patches(attention_mask, patch_size)
-
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
             attention_mask,
-            (batch_size, patched_seq_length),
+            (batch_size, seq_length),
             inputs_embeds,
             past_key_values_length,
             sliding_window=None,
@@ -979,26 +999,110 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         )
 
 
+class UnpatchingTransformer(nn.Module):
+    """Small transformer for intelligent unpatching operations."""
+    
+    def __init__(self, hidden_dim: int, patch_size: int, input_size: int, horizon_length: int, num_heads: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.patch_size = patch_size
+        self.input_size = input_size
+        self.horizon_length = horizon_length
+        self.output_dim = input_size * horizon_length
+        
+        # Project from hidden to intermediate dimension
+        intermediate_dim = patch_size * self.output_dim
+        self.input_proj = nn.Linear(hidden_dim, intermediate_dim)
+        
+        # Multi-head attention for patch reconstruction
+        # Ensure num_heads is valid (must divide output_dim)
+        valid_num_heads = 1
+
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.output_dim,
+            num_heads=valid_num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # Layer norm and feed-forward
+        self.norm1 = nn.LayerNorm(self.output_dim)
+        self.norm2 = nn.LayerNorm(self.output_dim)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(self.output_dim, intermediate_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(intermediate_dim // 2, self.output_dim)
+        )
+    
+    def forward(self, x):
+        # x shape: [batch_size, hidden_dim]
+        batch_size = x.shape[0]
+        
+        # Project to patch space: [batch_size, patch_size * output_dim]
+        patch_data = self.input_proj(x)
+        
+        # Reshape to patch sequence: [batch_size, patch_size, output_dim]
+        patch_sequence = patch_data.view(batch_size, self.patch_size, self.output_dim)
+        
+        # Apply self-attention within patch for reconstruction
+        residual = patch_sequence
+        patch_sequence = self.norm1(patch_sequence)
+        attn_out, _ = self.attention(patch_sequence, patch_sequence, patch_sequence)
+        patch_sequence = residual + attn_out
+        
+        # Feed-forward
+        residual = patch_sequence
+        patch_sequence = self.norm2(patch_sequence)
+        ff_out = self.feed_forward(patch_sequence)
+        patch_sequence = residual + ff_out
+        
+        return patch_sequence  # [batch_size, patch_size, output_dim]
+
+
 class TimeMoeOutputLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, horizon_length: int, input_size: int = 1):
+    def __init__(self, config: TimeMoeConfig, horizon_length: int):
         super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.input_size = config.input_size
+        self.horizon_length = horizon_length
 
-        self.out_layer = nn.Linear(
-            hidden_size,
-            input_size * horizon_length,
-            bias=False,
+        # Transformer-based unpatching module
+        self.unpatching_transformer = UnpatchingTransformer(
+            hidden_dim=config.hidden_size,
+            patch_size=self.patch_size,
+            input_size=self.input_size,
+            horizon_length=horizon_length,
+            num_heads=4  # Use a fixed safe number
         )
 
     def forward(self, x):
         """
         Args:
-            x (torch.FloatTensor): with shape [B, patched_seq_len, hidden_size]
+            x (torch.FloatTensor): with shape [B, num_patches, hidden_size]
 
         Returns:
-            torch.FloatTensor: final prediction with shape [B, patched_seq_len, input_size * horizon_length]
+            torch.FloatTensor: final prediction with shape [B, orig_seq_len, input_size * horizon_length]
         """
-        return self.out_layer(x)
+        batch_size, num_patches, hidden_size = x.shape
+        
+        # Reshape for efficient batch processing: [batch_size * num_patches, hidden_size]
+        x_flat = x.view(batch_size * num_patches, hidden_size)
+        
+        # Apply transformer-based unpatching to all patches at once
+        patch_outputs_flat = self.unpatching_transformer(x_flat)  # [batch_size * num_patches, patch_size, output_dim]
+        
+        # Reshape back: [batch_size, num_patches, patch_size, output_dim]
+        patch_outputs = patch_outputs_flat.view(batch_size, num_patches, self.patch_size, self.input_size * self.horizon_length)
+        
+        # Flatten patches back to original sequence: [B, num_patches * patch_size, output_dim]
+        orig_seq_len = num_patches * self.patch_size
+        outputs = patch_outputs.view(batch_size, orig_seq_len, self.input_size * self.horizon_length)
+        
+        return outputs
 
 
 class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
@@ -1017,8 +1121,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         for i, horizon_length in enumerate(config.horizon_lengths):
             lm_head_list.append(
                 TimeMoeOutputLayer(
-                    hidden_size=self.config.hidden_size,
-                    input_size=self.config.input_size,
+                    config=config,
                     horizon_length=horizon_length,
                 )
             )
@@ -1050,7 +1153,6 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
             max_horizon_length: Optional[int] = None,
-            **kwargs,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1095,7 +1197,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                     router_logits,
                     top_k=self.num_experts_per_tok,
                     num_experts=self.config.num_experts,
-                    attention_mask=None  # Use None for patched sequences to avoid complexity
+                    attention_mask=attention_mask
                 )
                 loss += self.router_aux_loss_factor * temporal_aux_loss.to(loss.device)
         else:
@@ -1128,158 +1230,52 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         )
 
     def calc_ar_loss(self, predictions, labels, loss_masks, horizon_length):
-        patch_size = getattr(self.config, 'patch_size', 1)
-        
         if len(labels.shape) == 2:
             labels.unsqueeze_(dim=-1)
+            # enable model parallelism
             labels = labels.to(predictions.device)
         if loss_masks is not None and len(loss_masks.shape) == 2:
             loss_masks.unsqueeze_(dim=-1)
+            # enable model parallelism
             loss_masks = loss_masks.to(predictions.device)
 
-        # For patched sequences, we predict at patch positions but still forecast contiguous points
-        if patch_size > 1:
-            batch_size, original_seq_len, input_size = labels.shape
-            
-            # We have predictions at patch positions: [batch, num_patches, horizon_length * input_size]
-            # We need to create targets that are horizon_length contiguous points starting from each patch position
-            
-            num_patches = original_seq_len // patch_size
-            trimmed_len = num_patches * patch_size
-            
-            # Trim labels to match the trimmed input sequence
-            labels = labels[:, :trimmed_len, :]
-            if loss_masks is not None:
-                loss_masks = loss_masks[:, :trimmed_len, :]
-            
-            # For each patch position i, we want to predict the next horizon_length points
-            # starting from position (i+1) * patch_size
-            patch_predictions = predictions  # [batch, num_patches, horizon_length * input_size]
-            
-            # Create targets: for each patch position, get the next horizon_length contiguous points
-            target_list = []
-            mask_list = []
-            
-            for patch_idx in range(num_patches):
-                # Start position for targets (right after current patch)
-                start_pos = (patch_idx + 1) * patch_size
-                end_pos = start_pos + horizon_length
-                
-                if end_pos <= original_seq_len:
-                    # We have enough future points
-                    target = labels[:, start_pos:end_pos, :]  # [batch, horizon_length, input_size]
-                    if loss_masks is not None:
-                        mask = loss_masks[:, start_pos:end_pos, :]  # [batch, horizon_length, input_size]
-                    else:
-                        mask = None
-                else:
-                    # Pad with zeros if we don't have enough future points
-                    available_points = max(0, original_seq_len - start_pos)
-                    if available_points > 0:
-                        target = F.pad(
-                            labels[:, start_pos:original_seq_len, :], 
-                            (0, 0, 0, horizon_length - available_points), 
-                            mode='constant', value=0
-                        )
-                        if loss_masks is not None:
-                            mask = F.pad(
-                                loss_masks[:, start_pos:original_seq_len, :],
-                                (0, 0, 0, horizon_length - available_points),
-                                mode='constant', value=0
-                            )
-                        else:
-                            mask = torch.zeros(batch_size, horizon_length, input_size, 
-                                             device=labels.device, dtype=torch.float32)
-                    else:
-                        # No future points available
-                        target = torch.zeros(batch_size, horizon_length, input_size, 
-                                           device=labels.device, dtype=labels.dtype)
-                        mask = torch.zeros_like(target) if loss_masks is not None else torch.zeros(batch_size, horizon_length, input_size, 
-                                             device=labels.device, dtype=torch.float32)
-                
-                target_list.append(target)
-                if loss_masks is not None:
-                    mask_list.append(mask)
-                else:
-                    mask_list.append(mask)
-            
-            # Stack targets: [batch, num_patches, horizon_length, input_size]
-            shift_labels = torch.stack(target_list, dim=1)
-            if loss_masks is not None:
-                patch_loss_masks = torch.stack(mask_list, dim=1)
-            else:
-                patch_loss_masks = torch.stack(mask_list, dim=1)
-            
-            # Reshape predictions to match: [batch, num_patches, horizon_length, input_size]
-            shift_predictions = patch_predictions.view(batch_size, num_patches, horizon_length, input_size)
-            
-        else:
-            # No patching - use original logic
-            if horizon_length > 1:
-                batch_size, seq_len, output_size = predictions.shape
-                shift_predictions = predictions.view(batch_size, seq_len, horizon_length, -1)
+        if horizon_length > 1:
+            batch_size, seq_len, output_size = predictions.shape
+            shift_predictions = predictions.view(batch_size, seq_len, horizon_length, -1)
 
+            # pad to the same length with predictions
+            # shape -> [B, input_size, seq_len + horizon_length -1]
+            labels = F.pad(labels.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
+
+            # shape -> [B, input_size, seq_len, horizon_length]
+            shift_labels = labels.unfold(dimension=-1, size=horizon_length, step=1)
+            shift_labels = shift_labels.permute(0, 2, 3, 1)
+
+            if loss_masks is not None:
                 # pad to the same length with predictions
-                # shape -> [B, input_size, seq_len + horizon_length -1]
-                labels = F.pad(labels.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
+                loss_masks = F.pad(loss_masks.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
 
-                # shape -> [B, input_size, seq_len, horizon_length]
-                shift_labels = labels.unfold(dimension=-1, size=horizon_length, step=1)
-                shift_labels = shift_labels.permute(0, 2, 3, 1)
+                loss_masks = loss_masks.unfold(dimension=-1, size=horizon_length, step=1)
+                loss_masks = loss_masks.permute(0, 2, 3, 1)
 
-                if loss_masks is not None:
-                    # pad to the same length with predictions
-                    loss_masks = F.pad(loss_masks.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
-                    loss_masks = loss_masks.unfold(dimension=-1, size=horizon_length, step=1)
-                    loss_masks = loss_masks.permute(0, 2, 3, 1)
-                    patch_loss_masks = loss_masks
-                else:
-                    patch_loss_masks = None
-            else:
-                shift_predictions = predictions
-                shift_labels = labels
-                patch_loss_masks = loss_masks
+        else:
+            shift_predictions = predictions
+            shift_labels = labels
 
         # Calculate loss with mask
         losses = self.loss_function(shift_predictions, shift_labels)
 
-        if patch_loss_masks is not None:
-            losses = losses * patch_loss_masks
-            # Avoid division by zero
-            mask_sum = patch_loss_masks.sum()
-            if mask_sum > 0:
-                loss = losses.sum() / mask_sum
-            else:
-                loss = torch.mean(losses)
+        if loss_masks is not None:
+            losses = losses * loss_masks
+            loss = losses.sum() / loss_masks.sum()
         else:
             loss = torch.mean(losses)
 
         return loss
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        # Handle patching for generation
-        patch_size = getattr(self.config, 'patch_size', 1)
-        
-        if patch_size > 1 and input_ids is not None:
-            # Ensure input_ids length is compatible with patching
-            seq_len = input_ids.shape[1]
-            remainder = seq_len % patch_size
-            
-            if remainder > 0:
-                # Pad to complete the patch
-                padding_needed = patch_size - remainder
-                # input_ids shape: [batch_size, seq_len, input_size]
-                # Pad the sequence dimension (axis 1)
-                input_ids = F.pad(input_ids, (0, 0, 0, padding_needed), mode='constant', value=0)
-                
-                # Also update attention_mask if provided
-                if attention_mask is not None:
-                    # attention_mask shape: [batch_size, seq_len]
-                    # Pad the sequence dimension (axis 1)
-                    attention_mask = F.pad(attention_mask, (0, padding_needed), mode='constant', value=0)
-
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
@@ -1294,68 +1290,33 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
 
-            # For patched sequences, need to convert lengths to patch-level
-            if patch_size > 1:
-                # Convert cache lengths to patch-level
-                past_length_patches = past_length
-                input_patches = input_ids.shape[1] // patch_size
-                if attention_mask is not None:
-                    attention_patches = attention_mask.shape[1] // patch_size
-                else:
-                    attention_patches = input_patches
-            else:
-                past_length_patches = past_length
-                input_patches = input_ids.shape[1]
-                attention_patches = attention_mask.shape[1] if attention_mask is not None else input_patches
-
             # Keep only the unprocessed tokens:
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
             # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
             # input)
-            if attention_mask is not None and attention_patches > input_patches:
-                tokens_to_keep = attention_patches - past_length_patches
-                if patch_size > 1:
-                    input_ids = input_ids[:, -(tokens_to_keep * patch_size):, :]
-                else:
-                    input_ids = input_ids[:, -tokens_to_keep:]
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
-            elif past_length_patches < input_patches:
-                if patch_size > 1:
-                    input_ids = input_ids[:, (past_length_patches * patch_size):, :]
-                else:
-                    input_ids = input_ids[:, past_length_patches:]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
             # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
             if (
                     max_cache_length is not None
                     and attention_mask is not None
-                    and cache_length + input_patches > max_cache_length
+                    and cache_length + input_ids.shape[1] > max_cache_length
             ):
-                if patch_size > 1:
-                    attention_mask = attention_mask[:, -(max_cache_length * patch_size):]
-                else:
-                    attention_mask = attention_mask[:, -max_cache_length:]
+                attention_mask = attention_mask[:, -max_cache_length:]
 
-            position_ids = kwargs.get("position_ids", None)
-            if attention_mask is not None and position_ids is None:
-                # create position_ids on the fly for batch generation
-                if patch_size > 1:
-                    # For patched sequences, position_ids should be at patch level
-                    patch_attention_mask = self.model._convert_attention_mask_to_patches(attention_mask, patch_size)
-                    position_ids = patch_attention_mask.long().cumsum(-1) - 1
-                    position_ids.masked_fill_(patch_attention_mask == 0, 1)
-                    if past_key_values:
-                        position_ids = position_ids[:, -input_patches:]
-                else:
-                    position_ids = attention_mask.long().cumsum(-1) - 1
-                    position_ids.masked_fill_(attention_mask == 0, 1)
-                    if past_key_values:
-                        position_ids = position_ids[:, -input_ids.shape[1]:]
-
-        else:
-            position_ids = kwargs.get("position_ids", None)
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1]:]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:

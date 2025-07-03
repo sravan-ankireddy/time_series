@@ -9,7 +9,7 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 16,
+            patch_size: int = 8,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
             horizon_lengths: List[int] = 1,

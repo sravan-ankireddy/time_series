@@ -162,6 +162,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # Ensure position_ids are within bounds of the cos/sin cache
+    max_pos = cos.size(0) - 1
+    position_ids = torch.clamp(position_ids, 0, max_pos)
+    
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -169,23 +173,246 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+class TemporalPatchingTransformer(nn.Module):
+    """Advanced transformer for temporal patching that preserves local time series features."""
+    
+    def __init__(self, input_dim: int, patch_size: int, hidden_dim: int, num_heads: int = 8):
+        super().__init__()
+        self.input_dim = input_dim
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        
+        # Use a richer embedding dimension for better feature representation
+        self.embed_dim = max(64, hidden_dim // 4)  # Ensure sufficient capacity
+        self.num_heads = min(num_heads, self.embed_dim // 8)  # Ensure head_dim >= 8
+        if self.embed_dim % self.num_heads != 0:
+            self.num_heads = max(1, self.embed_dim // 8)
+        
+        # Input projection to richer embedding space
+        self.input_proj = nn.Linear(input_dim, self.embed_dim)
+        
+        # Learnable positional embeddings for temporal positions within patch
+        self.pos_embedding = nn.Parameter(torch.randn(1, patch_size, self.embed_dim) * 0.02)
+        
+        # Temporal convolution for local feature extraction
+        self.temporal_conv = nn.Conv1d(
+            in_channels=self.embed_dim,
+            out_channels=self.embed_dim,
+            kernel_size=min(3, patch_size),
+            padding=min(3, patch_size) // 2,
+            groups=self.embed_dim // 4 if self.embed_dim >= 4 else 1
+        )
+        
+        # Multi-head attention for temporal modeling
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(self.embed_dim)
+        self.norm2 = nn.LayerNorm(self.embed_dim)
+        self.norm3 = nn.LayerNorm(self.embed_dim)
+        
+        # Feed-forward network
+        ff_dim = self.embed_dim * 2
+        self.feed_forward = nn.Sequential(
+            nn.Linear(self.embed_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(ff_dim, self.embed_dim)
+        )
+        
+        # Intelligent aggregation instead of simple mean pooling
+        self.aggregation = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.embed_dim // 2, 1)
+        )
+        
+        # Final projection to target hidden dimension
+        self.output_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+    
+    def forward(self, x):
+        # x shape: [batch_size, patch_size, input_size]
+        batch_size, seq_len, _ = x.shape
+        
+        # Project to embedding space
+        x = self.input_proj(x)  # [batch_size, patch_size, embed_dim]
+        
+        # Add positional embeddings
+        x = x + self.pos_embedding[:, :seq_len, :]
+        x = self.norm1(x)
+        
+        # Apply temporal convolution for local feature extraction
+        conv_input = x.transpose(1, 2)  # [batch_size, embed_dim, patch_size]
+        conv_out = self.temporal_conv(conv_input)
+        conv_out = conv_out.transpose(1, 2)  # [batch_size, patch_size, embed_dim]
+        x = x + conv_out
+        x = self.norm2(x)
+        
+        # Self-attention for temporal dependencies
+        residual = x
+        attn_out, attn_weights = self.attention(x, x, x)
+        x = residual + attn_out
+        
+        # Feed-forward
+        residual = x
+        x = self.norm3(x)
+        ff_out = self.feed_forward(x)
+        x = residual + ff_out
+        
+        # Intelligent aggregation using attention-based pooling
+        # Compute attention weights for each time step
+        attn_scores = self.aggregation(x)  # [batch_size, patch_size, 1]
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        
+        # Weighted aggregation
+        patch_embedding = torch.sum(x * attn_weights, dim=1)  # [batch_size, embed_dim]
+        
+        # Project to final hidden dimension
+        output = self.output_proj(patch_embedding)  # [batch_size, hidden_dim]
+        
+        return output
+
+
+class TimeSeriesFeatureExtractor(nn.Module):
+    """Extract time series specific features before patching."""
+    
+    def __init__(self, input_size: int, patch_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = patch_size
+        
+        # Multi-scale temporal convolutions
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(input_size, input_size, kernel_size=k, padding=k//2, groups=input_size)
+            for k in [3, 5, 7] if k <= patch_size
+        ])
+        
+        # Trend and seasonality decomposition (learnable)
+        self.trend_filter = nn.Conv1d(input_size, input_size, kernel_size=min(patch_size, 7), 
+                                     padding=min(patch_size, 7)//2, groups=input_size)
+        
+        # Local statistics extraction
+        self.local_stats = nn.ModuleList([
+            nn.AvgPool1d(kernel_size=min(3, patch_size), stride=1, padding=min(3, patch_size)//2),
+            nn.MaxPool1d(kernel_size=min(3, patch_size), stride=1, padding=min(3, patch_size)//2)
+        ])
+        
+        # Feature fusion
+        total_features = input_size * (len(self.conv_layers) + 3)  # conv + trend + avg + max
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(total_features, input_size * 2),
+            nn.GELU(),
+            nn.Linear(input_size * 2, input_size)
+        )
+    
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, input_size]
+        batch_size, seq_len, input_size = x.shape
+        
+        # Transpose for conv1d: [batch_size, input_size, seq_len]
+        x_conv = x.transpose(1, 2)
+        
+        features = []
+        
+        # Multi-scale convolutions
+        for conv in self.conv_layers:
+            conv_out = conv(x_conv)
+            features.append(conv_out.transpose(1, 2))  # Back to [batch_size, seq_len, input_size]
+        
+        # Trend component
+        trend = self.trend_filter(x_conv).transpose(1, 2)
+        features.append(trend)
+        
+        # Local statistics
+        avg_out = self.local_stats[0](x_conv).transpose(1, 2)
+        max_out = self.local_stats[1](x_conv).transpose(1, 2)
+        features.append(avg_out)
+        features.append(max_out)
+        
+        # Concatenate all features
+        all_features = torch.cat(features, dim=-1)  # [batch_size, seq_len, total_features]
+        
+        # Fuse features
+        enhanced_x = self.feature_fusion(all_features)
+        
+        # Residual connection
+        return x + enhanced_x
+
+
 class TimeMoeInputEmbedding(nn.Module):
     """
-    Use a mlp layer to embedding the time-series.
+    Use transformer-based patching to embedding the time-series.
     """
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.config = config
         self.input_size = config.input_size  # default 1
+        self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.emb_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+        
+        # Transformer-based patching module
+        self.patching_transformer = TemporalPatchingTransformer(
+            input_dim=self.input_size,
+            patch_size=self.patch_size,
+            hidden_dim=self.hidden_size,
+            num_heads=8  # Use more heads for better temporal modeling
+        )
+
+        # Time series specific feature extractor
+        self.feature_extractor = TimeSeriesFeatureExtractor(
+            input_size=self.input_size,
+            patch_size=self.patch_size
+        )
 
     def forward(self, x):
-        emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
-        return emb
+        # x shape: [batch_size, seq_len, input_size]
+        batch_size, seq_len, input_size = x.shape
+        
+        # Extract time series features first
+        x = self.feature_extractor(x)
+        
+        # Create patches: group patch_size consecutive samples
+        # Pad sequence if necessary
+        if seq_len % self.patch_size != 0:
+            pad_len = self.patch_size - (seq_len % self.patch_size)
+            x = F.pad(x, (0, 0, 0, pad_len), mode='constant', value=0)
+            seq_len = x.shape[1]
+        
+        # Reshape to patches: [batch_size, num_patches, patch_size, input_size]
+        num_patches = seq_len // self.patch_size
+        x_patches = x.view(batch_size, num_patches, self.patch_size, input_size)
+        
+        # Reshape for efficient batch processing: [batch_size * num_patches, patch_size, input_size]
+        x_patches_flat = x_patches.view(batch_size * num_patches, self.patch_size, input_size)
+        
+        # Apply transformer-based patching to all patches at once
+        patch_embeddings_flat = self.patching_transformer(x_patches_flat)  # [batch_size * num_patches, hidden_size]
+        
+        # Reshape back: [batch_size, num_patches, hidden_size]
+        embeddings = patch_embeddings_flat.view(batch_size, num_patches, self.hidden_size)
+        
+        return embeddings
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -803,7 +1030,10 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         elif input_ids is not None:
             if len(input_ids.shape) == 2:
                 input_ids.unsqueeze_(dim=-1)
-            batch_size, seq_length, _ = input_ids.shape
+            batch_size, orig_seq_length, _ = input_ids.shape
+            # After patching, sequence length becomes orig_seq_length // patch_size (with padding if needed)
+            padded_seq_length = orig_seq_length if orig_seq_length % self.embed_layer.patch_size == 0 else orig_seq_length + (self.embed_layer.patch_size - orig_seq_length % self.embed_layer.patch_size)
+            seq_length = padded_seq_length // self.embed_layer.patch_size
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
@@ -829,13 +1059,37 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
-            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-            position_ids = position_ids.view(-1, seq_length)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            if position_ids.size(-1) != seq_length:
+                # Adjust position_ids to match patched sequence length
+                # Create new position_ids for patched sequence (0, 1, 2, ...)
+                batch_size_pos = position_ids.size(0)
+                position_ids = torch.arange(seq_length, device=position_ids.device, dtype=torch.long)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size_pos, -1)
+            position_ids = position_ids.long()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_layer(input_ids)
+
+        # Adjust attention mask to match the patched sequence length
+        if attention_mask is not None and attention_mask.size(-1) != seq_length:
+            # If attention mask has original sequence length but we need patched length
+            if attention_mask.size(-1) % self.embed_layer.patch_size == 0:
+                # Reshape attention mask to match patched sequence length
+                batch_size_mask = attention_mask.size(0)
+                orig_seq_len = attention_mask.size(-1)
+                # Take every patch_size-th element (or use max pooling to preserve attention)
+                attention_mask = attention_mask.view(batch_size_mask, orig_seq_len // self.embed_layer.patch_size, self.embed_layer.patch_size)
+                attention_mask = attention_mask.max(dim=-1)[0]  # Use max to preserve attention
+            else:
+                # Pad and then reshape if needed
+                pad_length = self.embed_layer.patch_size - (attention_mask.size(-1) % self.embed_layer.patch_size)
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_length), value=0)
+                batch_size_mask = attention_mask.size(0)
+                padded_seq_len = attention_mask.size(-1)
+                attention_mask = attention_mask.view(batch_size_mask, padded_seq_len // self.embed_layer.patch_size, self.embed_layer.patch_size)
+                attention_mask = attention_mask.max(dim=-1)[0]  # Use max to preserve attention
 
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -913,27 +1167,186 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         )
 
 
+class TemporalUnpatchingTransformer(nn.Module):
+    """Advanced transformer for temporal unpatching that reconstructs time series with preserved structure."""
+    
+    def __init__(self, hidden_dim: int, patch_size: int, input_size: int, horizon_length: int, num_heads: int = 8):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.patch_size = patch_size
+        self.input_size = input_size
+        self.horizon_length = horizon_length
+        self.output_dim = input_size * horizon_length
+        
+        # Use intermediate embedding dimension for better reconstruction
+        self.embed_dim = max(128, hidden_dim // 2)
+        self.num_heads = min(num_heads, self.embed_dim // 8)
+        if self.embed_dim % self.num_heads != 0:
+            self.num_heads = max(1, self.embed_dim // 8)
+        
+        # Project from hidden dimension to reconstruction space
+        self.input_proj = nn.Sequential(
+            nn.Linear(hidden_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU()
+        )
+        
+        # Learnable positional embeddings for temporal positions within patch
+        self.pos_embedding = nn.Parameter(torch.randn(1, patch_size, self.embed_dim) * 0.02)
+        
+        # Generate initial patch sequence from compressed representation
+        self.sequence_generator = nn.Linear(self.embed_dim, patch_size * self.embed_dim)
+        
+        # Temporal deconvolution for local feature reconstruction
+        self.temporal_deconv = nn.ConvTranspose1d(
+            in_channels=self.embed_dim,
+            out_channels=self.embed_dim,
+            kernel_size=min(3, patch_size),
+            padding=min(3, patch_size) // 2,
+            groups=self.embed_dim // 4 if self.embed_dim >= 4 else 1
+        )
+        
+        # Multi-head attention for temporal reconstruction
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(self.embed_dim)
+        self.norm2 = nn.LayerNorm(self.embed_dim)
+        self.norm3 = nn.LayerNorm(self.embed_dim)
+        
+        # Feed-forward network for refinement
+        ff_dim = self.embed_dim * 2
+        self.feed_forward = nn.Sequential(
+            nn.Linear(self.embed_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(ff_dim, self.embed_dim)
+        )
+        
+        # Progressive refinement layers
+        self.refinement_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.LayerNorm(self.embed_dim),
+                nn.GELU()
+            ) for _ in range(2)
+        ])
+        
+        # Final projection to output dimension with residual connection
+        self.output_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.output_dim),
+            nn.LayerNorm(self.output_dim)
+        )
+        
+        # Direct prediction path for skip connection
+        self.direct_proj = nn.Linear(hidden_dim, patch_size * self.output_dim)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.ConvTranspose1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+    
+    def forward(self, x):
+        # x shape: [batch_size, hidden_dim]
+        batch_size = x.shape[0]
+        
+        # Project to embedding space
+        x_embed = self.input_proj(x)  # [batch_size, embed_dim]
+        
+        # Generate initial sequence
+        sequence_data = self.sequence_generator(x_embed)  # [batch_size, patch_size * embed_dim]
+        patch_sequence = sequence_data.view(batch_size, self.patch_size, self.embed_dim)
+        
+        # Add positional embeddings
+        patch_sequence = patch_sequence + self.pos_embedding
+        patch_sequence = self.norm1(patch_sequence)
+        
+        # Apply temporal deconvolution for local structure reconstruction
+        conv_input = patch_sequence.transpose(1, 2)  # [batch_size, embed_dim, patch_size]
+        conv_out = self.temporal_deconv(conv_input)
+        conv_out = conv_out.transpose(1, 2)  # [batch_size, patch_size, embed_dim]
+        patch_sequence = patch_sequence + conv_out
+        patch_sequence = self.norm2(patch_sequence)
+        
+        # Self-attention for temporal dependencies
+        residual = patch_sequence
+        attn_out, _ = self.attention(patch_sequence, patch_sequence, patch_sequence)
+        patch_sequence = residual + attn_out
+        
+        # Feed-forward refinement
+        residual = patch_sequence
+        patch_sequence = self.norm3(patch_sequence)
+        ff_out = self.feed_forward(patch_sequence)
+        patch_sequence = residual + ff_out
+        
+        # Progressive refinement
+        for refinement_layer in self.refinement_layers:
+            patch_sequence = patch_sequence + refinement_layer(patch_sequence)
+        
+        # Final projection to output space
+        output_sequence = self.output_proj(patch_sequence)  # [batch_size, patch_size, output_dim]
+        
+        # Add skip connection for better gradient flow
+        direct_output = self.direct_proj(x).view(batch_size, self.patch_size, self.output_dim)
+        output_sequence = output_sequence + direct_output
+        
+        return output_sequence  # [batch_size, patch_size, output_dim]
+
+
 class TimeMoeOutputLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, horizon_length: int, input_size: int = 1):
+    def __init__(self, config: TimeMoeConfig, horizon_length: int):
         super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.input_size = config.input_size
+        self.horizon_length = horizon_length
 
-        self.out_layer = nn.Linear(
-            hidden_size,
-            input_size * horizon_length,
-            bias=False,
+        # Transformer-based unpatching module
+        self.unpatching_transformer = TemporalUnpatchingTransformer(
+            hidden_dim=config.hidden_size,
+            patch_size=self.patch_size,
+            input_size=self.input_size,
+            horizon_length=horizon_length,
+            num_heads=8  # More heads for better reconstruction
         )
 
     def forward(self, x):
         """
-
         Args:
-            x (torch.FloatTensor): with shape [B, seq_len, hidden_size]
+            x (torch.FloatTensor): with shape [B, num_patches, hidden_size]
 
         Returns:
-    `       torch.FloatTensor: final prediction with shape [B, seq_len, input_size]
+            torch.FloatTensor: final prediction with shape [B, orig_seq_len, input_size * horizon_length]
         """
-        return self.out_layer(x)
+        batch_size, num_patches, hidden_size = x.shape
+        
+        # Reshape for efficient batch processing: [batch_size * num_patches, hidden_size]
+        x_flat = x.view(batch_size * num_patches, hidden_size)
+        
+        # Apply transformer-based unpatching to all patches at once
+        patch_outputs_flat = self.unpatching_transformer(x_flat)  # [batch_size * num_patches, patch_size, output_dim]
+        
+        # Reshape back: [batch_size, num_patches, patch_size, output_dim]
+        patch_outputs = patch_outputs_flat.view(batch_size, num_patches, self.patch_size, self.input_size * self.horizon_length)
+        
+        # Flatten patches back to original sequence: [B, num_patches * patch_size, output_dim]
+        orig_seq_len = num_patches * self.patch_size
+        outputs = patch_outputs.view(batch_size, orig_seq_len, self.input_size * self.horizon_length)
+        
+        return outputs
 
 
 class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
@@ -952,8 +1365,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         for i, horizon_length in enumerate(config.horizon_lengths):
             lm_head_list.append(
                 TimeMoeOutputLayer(
-                    hidden_size=self.config.hidden_size,
-                    input_size=self.config.input_size,
+                    config=config,
                     horizon_length=horizon_length,
                 )
             )
@@ -1152,7 +1564,6 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
-            logger.info('Use input_embedding')
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
@@ -1175,3 +1586,4 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+

@@ -162,6 +162,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+
+    # Ensure position_ids are within bounds of the cos/sin cache
+    max_pos = cos.size(0) - 1
+    position_ids = torch.clamp(position_ids, 0, max_pos)
+    
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -171,20 +176,40 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class TimeMoeInputEmbedding(nn.Module):
     """
-    Use a mlp layer to embedding the time-series.
+    Use a mlp layer to embedding the time-series with patching.
     """
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.config = config
         self.input_size = config.input_size  # default 1
+        self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.emb_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
+        
+        # Input size for patching: patch_size * input_size
+        patch_input_size = self.patch_size * self.input_size
+        
+        self.emb_layer = nn.Linear(patch_input_size, self.hidden_size, bias=False)
+        self.gate_layer = nn.Linear(patch_input_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
+        # x shape: [batch_size, seq_len, input_size]
+        batch_size, seq_len, input_size = x.shape
+        
+        # Create patches: group patch_size consecutive samples
+        # Pad sequence if necessary
+        if seq_len % self.patch_size != 0:
+            pad_len = self.patch_size - (seq_len % self.patch_size)
+            x = F.pad(x, (0, 0, 0, pad_len), mode='constant', value=0)
+            seq_len = x.shape[1]
+        
+        # Reshape to patches: [batch_size, num_patches, patch_size * input_size]
+        num_patches = seq_len // self.patch_size
+        x_patches = x.view(batch_size, num_patches, self.patch_size * input_size)
+        
+        # Apply embedding to patches
+        emb = self.act_fn(self.gate_layer(x_patches)) * self.emb_layer(x_patches)
         return emb
 
 
@@ -803,7 +828,10 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         elif input_ids is not None:
             if len(input_ids.shape) == 2:
                 input_ids.unsqueeze_(dim=-1)
-            batch_size, seq_length, _ = input_ids.shape
+            batch_size, orig_seq_length, _ = input_ids.shape
+            # After patching, sequence length becomes orig_seq_length // patch_size (with padding if needed)
+            padded_seq_length = orig_seq_length if orig_seq_length % self.embed_layer.patch_size == 0 else orig_seq_length + (self.embed_layer.patch_size - orig_seq_length % self.embed_layer.patch_size)
+            seq_length = padded_seq_length // self.embed_layer.patch_size
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
@@ -829,13 +857,44 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
-            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-            position_ids = position_ids.view(-1, seq_length)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            if position_ids.size(-1) != seq_length:
+                # Adjust position_ids to match patched sequence length
+                if position_ids.size(-1) % self.embed_layer.patch_size == 0:
+                    # Create new position_ids for patched sequence (0, 1, 2, ...)
+                    batch_size_pos = position_ids.size(0)
+                    position_ids = torch.arange(seq_length, device=position_ids.device, dtype=torch.long)
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size_pos, -1)
+                else:
+                    # Pad the position_ids length first, then create new sequence
+                    batch_size_pos = position_ids.size(0)
+                    position_ids = torch.arange(seq_length, device=position_ids.device, dtype=torch.long)
+                    position_ids = position_ids.unsqueeze(0).expand(batch_size_pos, -1)
+            position_ids = position_ids.long()
+
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_layer(input_ids)
+
+        # Adjust attention mask to match the patched sequence length
+        if attention_mask is not None and attention_mask.size(-1) != seq_length:
+            # If attention mask has original sequence length but we need patched length
+            if attention_mask.size(-1) % self.embed_layer.patch_size == 0:
+                # Reshape attention mask to match patched sequence length
+                batch_size_mask = attention_mask.size(0)
+                orig_seq_len = attention_mask.size(-1)
+                # Take every patch_size-th element (or use max pooling to preserve attention)
+                attention_mask = attention_mask.view(batch_size_mask, orig_seq_len // self.embed_layer.patch_size, self.embed_layer.patch_size)
+                attention_mask = attention_mask.max(dim=-1)[0]  # Use max to preserve attention
+            else:
+                # Pad and then reshape if needed
+                pad_length = self.embed_layer.patch_size - (attention_mask.size(-1) % self.embed_layer.patch_size)
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_length), value=0)
+                batch_size_mask = attention_mask.size(0)
+                padded_seq_len = attention_mask.size(-1)
+                attention_mask = attention_mask.view(batch_size_mask, padded_seq_len // self.embed_layer.patch_size, self.embed_layer.patch_size)
+                attention_mask = attention_mask.max(dim=-1)[0]  # Use max to preserve attention
 
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -915,25 +974,42 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
 class TimeMoeOutputLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, horizon_length: int, input_size: int = 1):
+    def __init__(self, config: TimeMoeConfig, horizon_length: int):
         super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.input_size = config.input_size
+        self.horizon_length = horizon_length
 
+        # Project from hidden_size to patch space (patch_size * input_size * horizon_length)
         self.out_layer = nn.Linear(
-            hidden_size,
-            input_size * horizon_length,
+            config.hidden_size,
+            self.patch_size * self.input_size * horizon_length,
             bias=False,
         )
 
     def forward(self, x):
         """
-
         Args:
-            x (torch.FloatTensor): with shape [B, seq_len, hidden_size]
+            x (torch.FloatTensor): with shape [B, num_patches, hidden_size]
 
         Returns:
-    `       torch.FloatTensor: final prediction with shape [B, seq_len, input_size]
+            torch.FloatTensor: final prediction with shape [B, orig_seq_len, input_size * horizon_length]
         """
-        return self.out_layer(x)
+        batch_size, num_patches, hidden_size = x.shape
+        
+        # Project to patch space: [B, num_patches, patch_size * input_size * horizon_length]
+        patch_outputs = self.out_layer(x)
+        
+        # Reshape to unfold patches back to original sequence length
+        # [B, num_patches, patch_size, input_size * horizon_length]
+        patch_outputs = patch_outputs.view(batch_size, num_patches, self.patch_size, self.input_size * self.horizon_length)
+        
+        # Flatten patches back to original sequence: [B, num_patches * patch_size, input_size * horizon_length]
+        orig_seq_len = num_patches * self.patch_size
+        outputs = patch_outputs.view(batch_size, orig_seq_len, self.input_size * self.horizon_length)
+        
+        return outputs
 
 
 class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
@@ -952,8 +1028,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         for i, horizon_length in enumerate(config.horizon_lengths):
             lm_head_list.append(
                 TimeMoeOutputLayer(
-                    hidden_size=self.config.hidden_size,
-                    input_size=self.config.input_size,
+                    config=config,
                     horizon_length=horizon_length,
                 )
             )

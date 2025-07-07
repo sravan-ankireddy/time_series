@@ -120,16 +120,25 @@ def load_balancing_loss_func(
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int, dim: int = 1) -> torch.Tensor:
     """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    This is the equivalent of torch.repeat_interleave(x, dim=dim, repeats=n_rep). 
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    when dim=1, or can repeat along other dimensions when specified.
     """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    
+    if dim == 1:
+        # Original behavior for transformer attention
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    elif dim == 2:
+        # For cross-attention where we might want to repeat along the head dimension
+        return torch.repeat_interleave(hidden_states, n_rep, dim=dim)
+    else:
+        return torch.repeat_interleave(hidden_states, n_rep, dim=dim)
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -186,6 +195,345 @@ class TimeMoeInputEmbedding(nn.Module):
     def forward(self, x):
         emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
         return emb
+
+
+class TimeMoeLocalSelfAttention(nn.Module):
+    """
+    Local self-attention module for point embeddings with sliding window.
+    """
+    
+    def __init__(self, config: TimeMoeConfig, window_size: int = 4):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_patch_attention_heads  # Use num_patch_attention_heads for local attention
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
+        self.window_size = window_size
+        
+        # Self-attention projections for point embeddings
+        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=True)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=False)
+        
+        # Layer norm and feedforward for point embeddings
+        self.layer_norm1 = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        self.layer_norm2 = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+        # Feedforward network
+        self.ffn = TimeMoeTemporalBlock(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.hidden_size * 2,  # Smaller expansion for efficiency
+            hidden_act=config.hidden_act
+        )
+    
+    def create_local_causal_attention_mask(self, seq_len, window_size, device):
+        """
+        Create causal local attention mask for sliding window attention.
+        Each position can only attend to itself and previous positions within the window.
+        """
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+        
+        for i in range(seq_len):
+            # Causal: only attend to current and previous positions
+            start = max(0, i - window_size + 1)  # Include current position
+            end = i + 1  # Only up to current position (causal)
+            mask[i, start:end] = 0.0
+            
+        return mask
+    
+    def forward(self, point_embeddings):
+        """
+        Args:
+            point_embeddings: [batch_size, num_patches, patch_size, hidden_size]
+        
+        Returns:
+            Enhanced point embeddings: [batch_size, num_patches, patch_size, hidden_size]
+        """
+        batch_size, num_patches, patch_size, hidden_size = point_embeddings.shape
+        
+        # Flatten point embeddings for local self-attention
+        # [batch_size, num_patches * patch_size, hidden_size]
+        point_flat = point_embeddings.view(batch_size, num_patches * patch_size, hidden_size)
+        
+        # Self-attention + residual connection
+        residual = point_flat
+        point_flat = self.layer_norm1(point_flat)
+        
+        # Self-attention computation
+        query_states = self.q_proj(point_flat)
+        key_states = self.k_proj(point_flat)
+        value_states = self.v_proj(point_flat)
+        
+        # Reshape for multi-head attention
+        seq_len = num_patches * patch_size
+        query_states = query_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # Apply causal local attention mask
+        local_mask = self.create_local_causal_attention_mask(seq_len, self.window_size, point_flat.device)
+        attn_weights = attn_weights + local_mask.unsqueeze(0).unsqueeze(0)  # Broadcast for batch and heads
+        
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        
+        # Output projection and residual connection
+        attn_output = self.o_proj(attn_output)
+        point_flat = residual + attn_output
+        
+        # Feedforward + residual connection
+        residual = point_flat
+        point_flat = self.layer_norm2(point_flat)
+        ffn_output = self.ffn(point_flat)
+        point_flat = residual + ffn_output
+        
+        # Reshape back to original point embeddings format
+        enhanced_points = point_flat.view(batch_size, num_patches, patch_size, hidden_size)
+        
+        return enhanced_points
+
+
+class TimeMoeCrossAttention(nn.Module):
+    """
+    Cross-attention block for patch enhancement, similar to BLT's CrossAttention.
+    Patches attend to point embeddings with causal masking.
+    """
+
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        
+        self.dim = config.hidden_size
+        self.head_dim = self.dim // config.num_patch_attention_heads
+        self.n_heads = config.num_patch_attention_heads
+        self.n_kv_heads = config.num_patch_attention_heads  # Same as n_heads for simplicity
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+        self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
+        
+        # Cross-attention layer norms (similar to BLT)
+        self.cross_attn_norm_q = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        self.cross_attn_norm_kv = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+        # Cross-attention projections
+        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+
+    def create_cross_attention_causal_mask(self, num_patches, patch_size, device):
+        """
+        Create causal mask for cross-attention where patches attend to point embeddings.
+        Each patch can only attend to point embeddings from current and previous patches.
+        """
+        mask = torch.full((num_patches, num_patches * patch_size), float('-inf'), device=device)
+        
+        for patch_idx in range(num_patches):
+            # Allow attention to all points in current and previous patches
+            end_point = (patch_idx + 1) * patch_size
+            mask[patch_idx, :end_point] = 0.0
+            
+        return mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: patch embeddings [batch_size, num_patches, dim] - Queries
+            kv: point embeddings [batch_size, num_patches * patch_size, dim] - Keys and Values
+            mask: causal mask for cross-attention
+        """
+        # B S D
+        bsz, seq_len, _ = x.shape
+        _, slen_kv, _ = kv.shape
+        
+        # Apply layer norms (similar to BLT)
+        x_norm = self.cross_attn_norm_q(x)
+        kv_norm = self.cross_attn_norm_kv(kv)
+
+        # Cross-attention projections
+        xq = self.wq(x_norm)
+        xk = self.wk(kv_norm)
+        xv = self.wv(kv_norm)
+
+        # Reshape for multi-head attention
+        xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, slen_kv, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, slen_kv, self.n_kv_heads, self.head_dim)
+
+        # Repeat k,v heads if needed (similar to BLT)
+        xk = repeat_kv(xk, self.heads_per_group)
+        xv = repeat_kv(xv, self.heads_per_group)
+
+        # Transpose for attention computation
+        xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # Apply mask if provided
+        if mask is not None:
+            attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)
+        
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, xv)
+        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        
+        # Output projection
+        output = self.wo(output.view(bsz, seq_len, -1))
+        
+        return x + output
+
+
+class TimeMoeCrossAttentionLayer(nn.Module):
+    """
+    Enhanced cross-attention layer for patch enhancement with point embedding updates.
+    Similar to BLT's LocalEncoder structure.
+    """
+    
+    def __init__(self, config: TimeMoeConfig, is_final_layer: bool = False):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.is_final_layer = is_final_layer
+        
+        # Cross-attention for patch enhancement
+        self.cross_attention = TimeMoeCrossAttention(config)
+        
+        # Layer norm and feedforward for patches
+        self.patch_norm = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+        # Feedforward network for patches
+        self.ffn = TimeMoeTemporalBlock(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.hidden_size * 4,  # Standard 4x expansion
+            hidden_act=config.hidden_act
+        )
+        
+        # Local self-attention for point embeddings (only if not final layer)
+        # Similar to BLT's pattern where final layer doesn't need to update point embeddings
+        if not is_final_layer:
+            self.point_local_attention = TimeMoeLocalSelfAttention(config, window_size=4)
+        else:
+            self.point_local_attention = None
+    
+    def forward(self, patch_embeddings, point_embeddings):
+        """
+        Args:
+            patch_embeddings: [batch_size, num_patches, hidden_size] - Queries
+            point_embeddings: [batch_size, num_patches, patch_size, hidden_size] - Keys and Values
+        
+        Returns:
+            Enhanced patch embeddings: [batch_size, num_patches, hidden_size]
+            Updated point embeddings: [batch_size, num_patches, patch_size, hidden_size]
+        """
+        batch_size, num_patches, hidden_size = patch_embeddings.shape
+        patch_size = point_embeddings.shape[2]
+        
+        # Flatten point embeddings for cross-attention
+        # [batch_size, num_patches * patch_size, hidden_size]
+        point_embeddings_flat = point_embeddings.view(batch_size, num_patches * patch_size, hidden_size)
+        
+        # Create causal mask for cross-attention
+        cross_mask = self.cross_attention.create_cross_attention_causal_mask(
+            num_patches, patch_size, patch_embeddings.device
+        )
+        
+        # Apply cross-attention: patches attend to point embeddings
+        patch_embeddings_cross = self.cross_attention(
+            x=patch_embeddings,
+            kv=point_embeddings_flat,
+            mask=cross_mask,
+        )
+        
+        # Feedforward + residual connection for patches
+        residual = patch_embeddings_cross
+        patch_embeddings_norm = self.patch_norm(patch_embeddings_cross)
+        ffn_output = self.ffn(patch_embeddings_norm)
+        patch_embeddings = residual + ffn_output
+        
+        # Update point embeddings using local self-attention AFTER cross-attention
+        # This ensures updated point embeddings are ready for the next layer
+        # Skip point embedding updates for final layer (not needed)
+        if self.point_local_attention is not None:
+            updated_point_embeddings = self.point_local_attention(point_embeddings)
+        else:
+            updated_point_embeddings = point_embeddings  # Return unchanged for final layer
+        
+        return patch_embeddings, updated_point_embeddings
+
+
+class TimeMoePatchEmbedding(nn.Module):
+    """
+    Enhanced patch embedding module with cross-attention for iterative refinement.
+    Similar to BLT's LocalEncoder structure with cross-attention layers.
+    """
+
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.num_cross_attention_layers = 2
+        
+        # Cross-attention layers for patch enhancement (similar to BLT)
+        self.cross_attn_layers = nn.ModuleList([
+            TimeMoeCrossAttentionLayer(config, is_final_layer=(i == self.num_cross_attention_layers - 1)) 
+            for i in range(self.num_cross_attention_layers)
+        ])
+        
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input embeddings of shape [batch_size, seq_len, hidden_size]
+        
+        Returns:
+            torch.Tensor: Enhanced patch embeddings of shape [batch_size, num_patches, hidden_size]
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        
+        # Calculate number of patches
+        num_patches = seq_len // self.patch_size
+        
+        if num_patches == 0:
+            # If sequence length is smaller than patch size, pad to at least one patch
+            pad_length = self.patch_size - seq_len
+            x_padded = F.pad(x, (0, 0, 0, pad_length), mode='constant', value=0)
+            num_patches = 1
+            truncated_seq_len = self.patch_size
+            x_truncated = x_padded
+        else:
+            # Truncate sequence to make it divisible by patch_size
+            truncated_seq_len = num_patches * self.patch_size
+            x_truncated = x[:, :truncated_seq_len, :]
+        
+        # Reshape to group sequences into patches (point embeddings)
+        # [batch_size, num_patches, patch_size, hidden_size]
+        point_embeddings = x_truncated.view(batch_size, num_patches, self.patch_size, hidden_size)
+        
+        # Initial patch embeddings using max-pooling (similar to BLT's downsampling)
+        # [batch_size, num_patches, hidden_size]
+        patch_embeddings, _ = torch.max(point_embeddings, dim=2)
+        
+        # Apply cross-attention layers iteratively (similar to BLT's LocalEncoder)
+        for i, cross_attn_layer in enumerate(self.cross_attn_layers):
+            patch_embeddings, point_embeddings = cross_attn_layer(patch_embeddings, point_embeddings)
+        
+        return patch_embeddings
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -766,6 +1114,11 @@ class TimeMoeModel(TimeMoePreTrainedModel):
     def __init__(self, config: TimeMoeConfig):
         super().__init__(config)
         self.embed_layer = TimeMoeInputEmbedding(config)
+
+        self.patch_size = config.patch_size
+        if self.patch_size > 1:
+            self.patch_embedding = TimeMoePatchEmbedding(config)
+
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -824,6 +1177,16 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_layer(input_ids)
+
+        if self.patch_size > 1:
+            # Apply patch embedding
+            inputs_embeds = self.patch_embedding(inputs_embeds)
+
+        # Update sequence length after patching
+        batch_size, seq_length, _ = inputs_embeds.shape
+
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
@@ -833,9 +1196,6 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             position_ids = position_ids.view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_layer(input_ids)
 
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -1071,6 +1431,9 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             # enable model parallelism
             loss_masks = loss_masks.to(predictions.device)
 
+        # Get patch size from config
+        patch_size = getattr(self.config, 'patch_size', 1)
+
         if horizon_length > 1:
             batch_size, seq_len, output_size = predictions.shape
             shift_predictions = predictions.view(batch_size, seq_len, horizon_length, -1)
@@ -1094,9 +1457,17 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             shift_predictions = predictions
             shift_labels = labels
 
+        # If patch_size > 1, we need to sample labels at patch boundaries
+        if patch_size > 1:
+            seq_len = predictions.shape[1]
+            max_start_pos = seq_len * patch_size - 1 
+            patch_starts = torch.arange(0, max_start_pos + 1, patch_size, device=labels.device)
+            shift_labels = shift_labels[:, patch_starts, :]
+            loss_masks = loss_masks[:, patch_starts, :] if loss_masks is not None else None
+                
         # Calculate loss with mask
         losses = self.loss_function(shift_predictions, shift_labels)
-
+        
         if loss_masks is not None:
             losses = losses * loss_masks
             loss = losses.sum() / loss_masks.sum()

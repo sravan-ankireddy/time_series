@@ -9,7 +9,8 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 4,
+            patch_size: int = 16,
+            num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
             horizon_lengths: List[int] = 1,
@@ -33,6 +34,7 @@ class TimeMoeConfig(PretrainedConfig):
     ):
         self.input_size = input_size
         self.patch_size = patch_size
+        self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings

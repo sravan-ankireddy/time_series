@@ -279,7 +279,7 @@ class TimeMoeLocalSelfAttention(nn.Module):
         local_mask = self.create_local_causal_attention_mask(seq_len, self.window_size, point_flat.device)
         attn_weights = attn_weights + local_mask.unsqueeze(0).unsqueeze(0)  # Broadcast for batch and heads
         
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=value_states.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         
         # Apply attention to values
@@ -387,7 +387,8 @@ class TimeMoeCrossAttention(nn.Module):
         if mask is not None:
             attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)
         
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        # Apply softmax with consistent dtype
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=xv.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         
         # Apply attention to values
@@ -1180,12 +1181,32 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_layer(input_ids)
 
+        # Store original sequence length for attention mask computation
+        original_seq_length = seq_length
+
         if self.patch_size > 1:
             # Apply patch embedding
             inputs_embeds = self.patch_embedding(inputs_embeds)
 
         # Update sequence length after patching
         batch_size, seq_length, _ = inputs_embeds.shape
+
+        # Update attention mask for patching BEFORE computing position_ids
+        if self.patch_size > 1 and attention_mask is not None:
+            # Truncate attention mask to match the truncated sequence length used in patching
+            num_patches = original_seq_length // self.patch_size
+            if num_patches > 0:
+                truncated_seq_len = num_patches * self.patch_size
+                attention_mask = attention_mask[:, :truncated_seq_len]
+            
+            # Create patch-level attention mask
+            # Each patch gets attention if any of its constituent tokens have attention
+            patch_attention_mask = attention_mask.view(batch_size, num_patches, self.patch_size)
+            patch_attention_mask = patch_attention_mask.max(dim=2)[0]  # [batch_size, num_patches]
+            attention_mask = patch_attention_mask
+        elif self.patch_size > 1 and attention_mask is None:
+            # Create default attention mask for patches
+            attention_mask = torch.ones(batch_size, seq_length, dtype=torch.long, device=inputs_embeds.device)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1195,8 +1216,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
             position_ids = position_ids.view(-1, seq_length)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
-
+            # FIX ME: update the position_ids to match the new sequence length by truncating
+            position_ids = position_ids[:, past_key_values_length:past_key_values_length + seq_length]
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
             attention_mask,

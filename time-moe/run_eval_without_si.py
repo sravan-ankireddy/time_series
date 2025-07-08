@@ -146,11 +146,16 @@ def evaluate(args):
             is_dist = True
         else:
             # single-GPU / CPU fallback
-            device = "cuda:1" if torch.cuda.is_available() else "cpu"
+            if args.gpu is not None:
+                device = f"cuda:{args.gpu}"
+            else:
+                device = "cuda:1" if torch.cuda.is_available() else "cpu"
             is_dist = False
     else:
         device = 'cpu'
         is_dist = False
+
+    print(f"Using device: {device}")
 
     # Store results for all downsampling rates
     all_results = {}
@@ -525,6 +530,12 @@ if __name__ == '__main__':
         type=int,
         default=1,
         help='Index of the data column in the CSV file (0-based). Required if date_col_idx is specified.'
+    )
+    parser.add_argument(
+        '--gpu',
+        type=int,
+        default=None,
+        help='GPU device ID to use (e.g., 0, 1, 2). If not specified, uses default device selection logic.'
     )
     args = parser.parse_args()
     if args.context_length is None:

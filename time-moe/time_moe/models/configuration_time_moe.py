@@ -9,9 +9,10 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 16,
+            patch_size: int = 4,
             patch_embedding_type: str = "linear",  # "transformer" or "linear"
             use_unpatchify: bool = True,  # Whether to use unpatchify module
+            num_patching_layers: int = 2,  # Number of cross-attention layers in transformer unpatchify
             num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
@@ -38,6 +39,7 @@ class TimeMoeConfig(PretrainedConfig):
         self.patch_size = patch_size
         self.patch_embedding_type = patch_embedding_type
         self.use_unpatchify = use_unpatchify
+        self.num_patching_layers = num_patching_layers
         self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

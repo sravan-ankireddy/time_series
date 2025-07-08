@@ -305,8 +305,8 @@ class TimeMoeLocalSelfAttention(nn.Module):
 
 class TimeMoeCrossAttention(nn.Module):
     """
-    Cross-attention block for patch enhancement, similar to BLT's CrossAttention.
-    Patches attend to point embeddings with causal masking.
+    Cross-attention block similar to BLT's CrossAttention.
+    Point embeddings (queries) attend to patch embeddings (keys/values).
     """
 
     def __init__(self, config: TimeMoeConfig):
@@ -319,8 +319,8 @@ class TimeMoeCrossAttention(nn.Module):
         self.heads_per_group = self.n_heads // self.n_kv_heads
         self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
         
-        # Cross-attention layer norms (similar to BLT)
-        self.cross_attn_norm_q = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        # Cross-attention layer norms (BLT pattern)
+        # Note: Only normalize the keys/values, not the queries (following BLT)
         self.cross_attn_norm_kv = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
         
         # Cross-attention projections
@@ -328,20 +328,6 @@ class TimeMoeCrossAttention(nn.Module):
         self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
-
-    def create_cross_attention_causal_mask(self, num_patches, patch_size, device):
-        """
-        Create causal mask for cross-attention where patches attend to point embeddings.
-        Each patch can only attend to point embeddings from current and previous patches.
-        """
-        mask = torch.full((num_patches, num_patches * patch_size), float('-inf'), device=device)
-        
-        for patch_idx in range(num_patches):
-            # Allow attention to all points in current and previous patches
-            end_point = (patch_idx + 1) * patch_size
-            mask[patch_idx, :end_point] = 0.0
-            
-        return mask
 
     def forward(
         self,
@@ -351,29 +337,27 @@ class TimeMoeCrossAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            x: patch embeddings [batch_size, num_patches, dim] - Queries
-            kv: point embeddings [batch_size, num_patches * patch_size, dim] - Keys and Values
-            mask: causal mask for cross-attention
+            x: point embeddings [batch_size, seq_len, dim] - Queries
+            kv: patch embeddings [batch_size, num_patches, dim] - Keys and Values
+            mask: attention mask (unused for unpatchify)
         """
-        # B S D
         bsz, seq_len, _ = x.shape
-        _, slen_kv, _ = kv.shape
+        _, num_kv, _ = kv.shape
         
-        # Apply layer norms (similar to BLT)
-        x_norm = self.cross_attn_norm_q(x)
+        # Apply layer norm to keys/values only (BLT pattern)
         kv_norm = self.cross_attn_norm_kv(kv)
 
         # Cross-attention projections
-        xq = self.wq(x_norm)
-        xk = self.wk(kv_norm)
-        xv = self.wv(kv_norm)
+        xq = self.wq(x)        # queries from point embeddings
+        xk = self.wk(kv_norm)  # keys from patch embeddings
+        xv = self.wv(kv_norm)  # values from patch embeddings
 
         # Reshape for multi-head attention
         xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, slen_kv, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, slen_kv, self.n_kv_heads, self.head_dim)
+        xk = xk.view(bsz, num_kv, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, num_kv, self.n_kv_heads, self.head_dim)
 
-        # Repeat k,v heads if needed (similar to BLT)
+        # Repeat k,v heads if needed
         xk = repeat_kv(xk, self.heads_per_group)
         xv = repeat_kv(xv, self.heads_per_group)
 
@@ -382,10 +366,6 @@ class TimeMoeCrossAttention(nn.Module):
         
         # Compute attention scores
         attn_weights = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        # Apply mask if provided
-        if mask is not None:
-            attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)
         
         # Apply softmax with consistent dtype
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=xv.dtype)
@@ -398,7 +378,30 @@ class TimeMoeCrossAttention(nn.Module):
         # Output projection
         output = self.wo(output.view(bsz, seq_len, -1))
         
-        return x + output
+        return output
+    
+    def create_cross_attention_causal_mask(self, num_patches, patch_size, device):
+        """
+        Create causal mask for cross-attention between patches and points.
+        Each patch can only attend to points from the same patch and previous patches.
+        """
+        patch_seq_len = num_patches
+        point_seq_len = num_patches * patch_size
+        
+        # Create mask: patches × points
+        mask = torch.zeros(patch_seq_len, point_seq_len, device=device)
+        
+        for patch_idx in range(num_patches):
+            # Each patch can attend to all points from current and previous patches
+            start_point = 0
+            end_point = (patch_idx + 1) * patch_size
+            mask[patch_idx, start_point:end_point] = 1.0
+        
+        # Convert to attention mask format (0 for attend, -inf for mask)
+        mask = mask.masked_fill(mask == 0, float('-inf'))
+        mask = mask.masked_fill(mask == 1, 0.0)
+        
+        return mask
 
 
 class TimeMoeCrossAttentionLayer(nn.Module):
@@ -489,7 +492,7 @@ class TimeMoePatchEmbedding(nn.Module):
         super().__init__()
         self.config = config
         self.patch_size = config.patch_size
-        self.num_cross_attention_layers = 2
+        self.num_cross_attention_layers = config.num_patching_layers
         
         # Cross-attention layers for patch enhancement (similar to BLT)
         self.cross_attn_layers = nn.ModuleList([
@@ -503,7 +506,9 @@ class TimeMoePatchEmbedding(nn.Module):
             x (torch.Tensor): Input embeddings of shape [batch_size, seq_len, hidden_size]
         
         Returns:
-            torch.Tensor: Enhanced patch embeddings of shape [batch_size, num_patches, hidden_size]
+            tuple: (patch_embeddings, final_point_embeddings)
+                - patch_embeddings: Enhanced patch embeddings [batch_size, num_patches, hidden_size]
+                - final_point_embeddings: Final point embeddings [batch_size, num_patches, patch_size, hidden_size]
         """
         batch_size, seq_len, hidden_size = x.shape
         
@@ -534,7 +539,9 @@ class TimeMoePatchEmbedding(nn.Module):
         for i, cross_attn_layer in enumerate(self.cross_attn_layers):
             patch_embeddings, point_embeddings = cross_attn_layer(patch_embeddings, point_embeddings)
         
-        return patch_embeddings
+        # Return both patch embeddings and final point embeddings
+        # The final point embeddings will be used by transformer unpatchify
+        return patch_embeddings, point_embeddings
 
 
 class TimeMoeLinearPatchEmbedding(nn.Module):
@@ -704,24 +711,16 @@ class TimeMoeLinearUnpatchify(nn.Module):
 
 class TimeMoeTransformerUnpatchify(nn.Module):
     """
-    Transformer-based unpatchify module for sophisticated patch-to-point reconstruction.
+    Transformer-based unpatchify module that mirrors BLT's LocalDecoder approach.
     
-    This module uses a more sophisticated approach than the linear unpatchify, leveraging
-    transformer layers to learn complex relationships between patch embeddings and their
-    constituent point embeddings. This is particularly useful when the patch embeddings
-    have been refined through complex cross-attention mechanisms.
+    This module works similarly to BLT's LocalDecoder:
+    1. Takes encoder point embeddings and patch embeddings from the model
+    2. Uses cross-attention where point embeddings (queries) attend to patch embeddings (keys/values)
+    3. Applies multiple cross-attention layers with residual connections
+    4. Outputs refined point embeddings at the original temporal resolution
     
-    Architecture:
-    1. Initial linear projection: patch_embedding -> patch_size point embeddings
-    2. Transformer refinement: Use self-attention to refine point embeddings within each patch
-    3. Optional cross-patch attention: Allow point embeddings to attend across patch boundaries
-    4. Final layer normalization
-    
-    For transformer patch embedding case, this module:
-    1. Takes patch embeddings of shape [batch_size, num_patches, hidden_size]
-    2. Projects each patch to patch_size initial point embeddings
-    3. Applies transformer layers for sophisticated reconstruction
-    4. Outputs refined point embeddings of shape [batch_size, seq_len, hidden_size]
+    The key insight from BLT is that the decoder uses cross-attention to refine
+    byte-level embeddings using patch-level representations.
     """
     
     def __init__(self, config: TimeMoeConfig):
@@ -729,124 +728,70 @@ class TimeMoeTransformerUnpatchify(nn.Module):
         self.config = config
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = min(config.num_attention_heads, 8)  # Limit for efficiency
-        self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
         
-        # Initial projection from patch embedding to point embeddings
-        self.initial_projection = nn.Linear(
-            self.hidden_size,
-            self.patch_size * self.hidden_size,
-            bias=True
-        )
+        # Mirror BLT's cross-attention configuration
+        self.cross_attn_decoder = True  # Always use cross-attention for unpatchify
+        self.cross_attn_all_layers = True  # Apply to all layers like BLT
+        self.num_cross_attention_layers = getattr(config, 'num_patching_layers', 2)  # Configurable number of layers
         
-        # Transformer layers for point embedding refinement
-        self.num_refinement_layers = 2  # Use 2 layers for sophisticated reconstruction
-        
-        # Self-attention for point embeddings within each patch
-        self.point_attention_layers = nn.ModuleList([
-            TimeMoeAttention(config, layer_idx=i) for i in range(self.num_refinement_layers)
+        # Cross-attention layers similar to BLT's LocalDecoder
+        self.cross_attn_layers = nn.ModuleList([
+            TimeMoeCrossAttention(config) 
+            for _ in range(self.num_cross_attention_layers)
         ])
         
-        # Layer normalization for each refinement layer
-        self.point_layer_norms = nn.ModuleList([
-            TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps) 
-            for _ in range(self.num_refinement_layers)
-        ])
-        
-        # Feed-forward networks for point refinement
-        self.point_ffns = nn.ModuleList([
-            TimeMoeTemporalBlock(
-                hidden_size=self.hidden_size,
-                intermediate_size=self.hidden_size * 2,  # Smaller expansion for efficiency
-                hidden_act=config.hidden_act
-            ) for _ in range(self.num_refinement_layers)
+        # Layer norms for each cross-attention layer (BLT pattern)
+        self.cross_attn_norms = nn.ModuleList([
+            TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+            for _ in range(self.num_cross_attention_layers)
         ])
         
         # Final output layer normalization
         self.final_layer_norm = TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         
-        # Optional: Cross-patch attention (allow points to attend across patch boundaries)
-        self.use_cross_patch_attention = True
-        if self.use_cross_patch_attention:
-            self.cross_patch_attention = TimeMoeAttention(config, layer_idx=self.num_refinement_layers)
-            self.cross_patch_norm = TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        
-    def forward(self, patch_embeddings, original_seq_len=None):
+    def forward(self, patch_embeddings, encoder_point_embeddings, original_seq_len=None):
         """
+        Forward pass similar to BLT's LocalDecoder cross-attention pattern.
+        
         Args:
-            patch_embeddings (torch.Tensor): Patch embeddings of shape [batch_size, num_patches, hidden_size]
+            patch_embeddings (torch.Tensor): Patch embeddings from the model [batch_size, num_patches, hidden_size]
+            encoder_point_embeddings (torch.Tensor): Point embeddings from encoder [batch_size, num_patches, patch_size, hidden_size]
             original_seq_len (int, optional): Original sequence length before patching
         
         Returns:
-            torch.Tensor: Refined point embeddings of shape [batch_size, seq_len, hidden_size]
+            torch.Tensor: Refined point embeddings [batch_size, seq_len, hidden_size]
         """
         batch_size, num_patches, hidden_size = patch_embeddings.shape
+        _, _, patch_size, _ = encoder_point_embeddings.shape
         
-        # Step 1: Initial projection to point embeddings
-        # [batch_size, num_patches, patch_size * hidden_size]
-        initial_points = self.initial_projection(patch_embeddings)
+        # Start with the encoder's point embeddings (similar to BLT's byte embeddings)
+        # Flatten to [batch_size, num_patches * patch_size, hidden_size]
+        h = encoder_point_embeddings.view(batch_size, num_patches * patch_size, hidden_size)
         
-        # Reshape to separate point dimension
-        # [batch_size, num_patches, patch_size, hidden_size]
-        initial_points = initial_points.view(batch_size, num_patches, self.patch_size, hidden_size)
-        
-        # Flatten for processing: [batch_size, num_patches * patch_size, hidden_size]
-        point_embeddings = initial_points.view(batch_size, num_patches * self.patch_size, hidden_size)
-        
-        # Step 2: Refinement through transformer layers
-        for layer_idx in range(self.num_refinement_layers):
-            # Self-attention within reconstructed points
-            residual = point_embeddings
-            point_embeddings = self.point_layer_norms[layer_idx](point_embeddings)
+        # Apply cross-attention layers (similar to BLT's LocalDecoder)
+        for i, cross_attn_layer in enumerate(self.cross_attn_layers):
+            # Apply layer normalization before cross-attention (BLT pattern)
+            h_norm = self.cross_attn_norms[i](h)
             
-            # Apply attention (no causal mask for unpatchify - we want bidirectional)
-            attention_output = self.point_attention_layers[layer_idx](
-                hidden_states=point_embeddings,
-                attention_mask=None,  # No masking for reconstruction
-                position_ids=None,
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False
+            # Cross-attention: point embeddings (queries) attend to patch embeddings (keys/values)
+            # This is the same pattern as BLT's LocalDecoder
+            h_cross = cross_attn_layer(
+                x=h_norm,           # queries (point embeddings)
+                kv=patch_embeddings,  # keys/values (patch embeddings)
+                mask=None           # No masking needed for unpatchify
             )
             
-            if isinstance(attention_output, tuple):
-                attention_output = attention_output[0]
-            
-            # Residual connection
-            point_embeddings = residual + attention_output
-            
-            # Feed-forward refinement
-            residual = point_embeddings
-            point_embeddings = self.point_ffns[layer_idx](point_embeddings)
-            point_embeddings = residual + point_embeddings
+            # Residual connection (BLT pattern)
+            h = h + h_cross
         
-        # Step 3: Optional cross-patch attention
-        if self.use_cross_patch_attention:
-            residual = point_embeddings
-            point_embeddings = self.cross_patch_norm(point_embeddings)
-            
-            cross_patch_output = self.cross_patch_attention(
-                hidden_states=point_embeddings,
-                attention_mask=None,
-                position_ids=None,
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False
-            )
-            
-            if isinstance(cross_patch_output, tuple):
-                cross_patch_output = cross_patch_output[0]
-            
-            point_embeddings = residual + cross_patch_output
+        # Apply final normalization
+        h = self.final_layer_norm(h)
         
-        # Step 4: Final normalization
-        point_embeddings = self.final_layer_norm(point_embeddings)
+        # Truncate to original sequence length if needed
+        if original_seq_len is not None and original_seq_len < h.size(1):
+            h = h[:, :original_seq_len, :]
         
-        # Step 5: Truncate to original sequence length if needed
-        if original_seq_len is not None and original_seq_len < point_embeddings.size(1):
-            point_embeddings = point_embeddings[:, :original_seq_len, :]
-        
-        return point_embeddings
+        return h
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -1528,6 +1473,9 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
         # Store original sequence length for attention mask computation
         original_seq_length = seq_length
+        
+        # Initialize encoder point embeddings (needed for transformer unpatchify)
+        encoder_point_embeddings = None
 
         if self.patch_size > 1:
             # Apply patch embedding
@@ -1536,7 +1484,11 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 inputs_embeds = self.patch_embedding(inputs_embeds)
             else:
                 # Transformer patch embedding expects embedded input [batch_size, seq_len, hidden_size]
-                inputs_embeds = self.patch_embedding(inputs_embeds)
+                # and returns both patch embeddings and final point embeddings
+                inputs_embeds, encoder_point_embeddings = self.patch_embedding(inputs_embeds)
+        
+        # Store encoder point embeddings for transformer unpatchify
+        self._encoder_point_embeddings = encoder_point_embeddings
 
         # Update sequence length after patching
         batch_size, seq_length, _ = inputs_embeds.shape
@@ -1621,7 +1573,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
         
-        # Apply unpatchify if using linear patch embedding
+        # Apply unpatchify if enabled
         # This projects patch embeddings back to point embeddings for fine-grained predictions
         if self.unpatchify is not None:
             # Store the patch-level sequence length
@@ -1630,8 +1582,23 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             # Calculate original sequence length before patching
             original_seq_len = getattr(self, '_original_seq_length', patch_seq_len * self.patch_size)
             
-            # Project patch embeddings back to point embeddings
-            hidden_states = self.unpatchify(hidden_states, original_seq_len)
+            # Apply appropriate unpatchify based on patch embedding type
+            if getattr(self.config, 'patch_embedding_type', 'transformer') == 'linear':
+                # Linear unpatchify: only needs patch embeddings
+                hidden_states = self.unpatchify(hidden_states, original_seq_len)
+            else:
+                # Transformer unpatchify: needs both patch embeddings and encoder point embeddings
+                encoder_point_embeddings = getattr(self, '_encoder_point_embeddings', None)
+                if encoder_point_embeddings is not None:
+                    hidden_states = self.unpatchify(hidden_states, encoder_point_embeddings, original_seq_len)
+                else:
+                    # Fallback: create dummy point embeddings if not available
+                    batch_size, num_patches, hidden_size = hidden_states.shape
+                    dummy_point_embeddings = torch.zeros(
+                        batch_size, num_patches, self.patch_size, hidden_size,
+                        device=hidden_states.device, dtype=hidden_states.dtype
+                    )
+                    hidden_states = self.unpatchify(hidden_states, dummy_point_embeddings, original_seq_len)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1930,3 +1897,175 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+
+
+class TimeMoeReverseAttentionLayer(nn.Module):
+    """
+    Reverse cross-attention layer that works as the inverse of TimeMoeCrossAttentionLayer.
+    
+    In the encoder: patches (queries) attend to points (keys/values) to refine patches
+    In unpatchify: points (queries) attend to patches (keys/values) to refine points
+    
+    This implements the reverse process to update point embeddings using patch embeddings.
+    """
+    
+    def __init__(self, config: TimeMoeConfig, layer_idx: int = 0):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+        
+        # Reverse cross-attention: points attend to patches
+        self.reverse_cross_attention = TimeMoeReverseCrossAttention(config)
+        
+        # Layer norm and feedforward for point embeddings
+        self.point_norm = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+        # Feedforward network for point embeddings
+        self.ffn = TimeMoeTemporalBlock(
+            hidden_size=self.hidden_size,
+            intermediate_size=self.hidden_size * 2,  # Smaller expansion for efficiency
+            hidden_act=config.hidden_act
+        )
+    
+    def forward(self, point_embeddings, patch_embeddings):
+        """
+        Args:
+            point_embeddings: [batch_size, num_patches, patch_size, hidden_size] - Queries
+            patch_embeddings: [batch_size, num_patches, hidden_size] - Keys and Values
+        
+        Returns:
+            Enhanced point embeddings: [batch_size, num_patches, patch_size, hidden_size]
+        """
+        batch_size, num_patches, patch_size, hidden_size = point_embeddings.shape
+        
+        # Flatten point embeddings for cross-attention
+        # [batch_size, num_patches * patch_size, hidden_size]
+        point_embeddings_flat = point_embeddings.view(batch_size, num_patches * patch_size, hidden_size)
+        
+        # Apply reverse cross-attention: points attend to patches
+        point_embeddings_cross = self.reverse_cross_attention(
+            x=point_embeddings_flat,  # queries (points)
+            kv=patch_embeddings,      # keys/values (patches)
+            num_patches=num_patches,
+            patch_size=patch_size
+        )
+        
+        # Feedforward + residual connection for point embeddings
+        residual = point_embeddings_cross
+        point_embeddings_norm = self.point_norm(point_embeddings_cross)
+        ffn_output = self.ffn(point_embeddings_norm)
+        point_embeddings_flat = residual + ffn_output
+        
+        # Reshape back to original point embeddings format
+        enhanced_point_embeddings = point_embeddings_flat.view(batch_size, num_patches, patch_size, hidden_size)
+        
+        return enhanced_point_embeddings
+
+
+class TimeMoeReverseCrossAttention(nn.Module):
+    """
+    Reverse cross-attention block where point embeddings attend to patch embeddings.
+    This is the inverse of TimeMoeCrossAttention used in the encoder.
+    """
+
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        
+        self.dim = config.hidden_size
+        self.head_dim = self.dim // config.num_patch_attention_heads
+        self.n_heads = config.num_patch_attention_heads
+        self.n_kv_heads = config.num_patch_attention_heads  # Same as n_heads for simplicity
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+        self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
+        
+        # Reverse cross-attention layer norms
+        self.cross_attn_norm_q = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        self.cross_attn_norm_kv = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+        # Cross-attention projections
+        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
+
+    def create_reverse_cross_attention_causal_mask(self, num_patches, patch_size, device):
+        """
+        Create causal mask for reverse cross-attention where points attend to patches.
+        Each point can only attend to patches that contain current or previous points.
+        """
+        # Total points = num_patches * patch_size
+        total_points = num_patches * patch_size
+        
+        # Create mask: [total_points, num_patches]
+        mask = torch.full((total_points, num_patches), float('-inf'), device=device)
+        
+        for point_idx in range(total_points):
+            # Calculate which patch this point belongs to
+            current_patch = point_idx // patch_size
+            # Allow attention to current and previous patches (causal)
+            mask[point_idx, :current_patch + 1] = 0.0
+            
+        return mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        num_patches: int,
+        patch_size: int,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: point embeddings [batch_size, num_patches * patch_size, dim] - Queries
+            kv: patch embeddings [batch_size, num_patches, dim] - Keys and Values
+            num_patches: number of patches
+            patch_size: size of each patch
+            mask: causal mask for cross-attention
+        """
+        bsz, seq_len, _ = x.shape
+        _, num_kv, _ = kv.shape
+        
+        # Apply layer norms
+        x_norm = self.cross_attn_norm_q(x)
+        kv_norm = self.cross_attn_norm_kv(kv)
+
+        # Cross-attention projections
+        xq = self.wq(x_norm)
+        xk = self.wk(kv_norm)
+        xv = self.wv(kv_norm)
+
+        # Reshape for multi-head attention
+        xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, num_kv, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, num_kv, self.n_kv_heads, self.head_dim)
+
+        # Repeat k,v heads if needed
+        xk = repeat_kv(xk, self.heads_per_group)
+        xv = repeat_kv(xv, self.heads_per_group)
+
+        # Transpose for attention computation
+        xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # Create and apply causal mask
+        if mask is None:
+            mask = self.create_reverse_cross_attention_causal_mask(num_patches, patch_size, x.device)
+        
+        attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)
+        
+        # Apply softmax with consistent dtype
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=xv.dtype)
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, xv)
+        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        
+        # Output projection
+        output = self.wo(output.view(bsz, seq_len, -1))
+        
+        return x + output

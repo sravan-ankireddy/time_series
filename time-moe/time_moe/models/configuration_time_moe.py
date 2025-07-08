@@ -9,7 +9,7 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 4,
+            patch_size: int = 1,
             patch_embedding_type: str = "linear",  # "transformer" or "linear"
             use_unpatchify: bool = True,  # Whether to use unpatchify module
             num_patching_layers: int = 2,  # Number of cross-attention layers in transformer unpatchify

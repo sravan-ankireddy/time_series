@@ -277,7 +277,7 @@ class TimeMoeLocalSelfAttention(nn.Module):
         
         # Apply causal local attention mask
         local_mask = self.create_local_causal_attention_mask(seq_len, self.window_size, point_flat.device)
-        attn_weights = attn_weights + local_mask.unsqueeze(0).unsqueeze(0)  # Broadcast for batch and heads
+        attn_weights = attn_weights + local_mask.unsqueeze(0).unsqueeze(0) # Broadcast for batch and heads
         
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=value_states.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
@@ -533,6 +533,100 @@ class TimeMoePatchEmbedding(nn.Module):
         # Apply cross-attention layers iteratively (similar to BLT's LocalEncoder)
         for i, cross_attn_layer in enumerate(self.cross_attn_layers):
             patch_embeddings, point_embeddings = cross_attn_layer(patch_embeddings, point_embeddings)
+        
+        return patch_embeddings
+
+
+class TimeMoeLinearPatchEmbedding(nn.Module):
+    """
+    Combined input embedding and patch embedding module that directly processes raw input.
+    This is a more efficient alternative to the transformer-based TimeMoePatchEmbedding.
+    
+    The approach:
+    1. Groups consecutive time points into patches of size `patch_size`
+    2. Flattens each patch: [patch_size, input_size] -> [patch_size * input_size]
+    3. Projects via linear layer: [patch_size * input_size] -> [hidden_size]
+    4. Applies layer normalization for stability
+    
+    This combines input embedding and patch embedding in one step, reducing computation
+    and memory usage compared to first embedding each point then combining patches.
+    
+    Compared to TimeMoePatchEmbedding:
+    - 95%+ fewer parameters (no cross-attention layers)
+    - Much faster computation (single matrix multiplication vs. multiple attention layers)
+    - Simpler and more stable training
+    - More efficient by combining input and patch embedding steps
+    - Still captures patch-level information effectively for many time series tasks
+    """
+
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.input_size = config.input_size
+        self.hidden_size = config.hidden_size
+        
+        # Combined input + patch embedding: directly from raw input to patch embeddings
+        # Takes patch_size * input_size input and outputs hidden_size (one embedding per patch)
+        self.patch_projection = nn.Linear(
+            self.patch_size * self.input_size, 
+            self.hidden_size, 
+            bias=True
+        )
+        
+        # Gate projection for gating mechanism (similar to TimeMoeInputEmbedding)
+        self.gate_projection = nn.Linear(
+            self.patch_size * self.input_size, 
+            self.hidden_size, 
+            bias=True
+        )
+        
+        # Activation function
+        self.act_fn = ACT2FN[config.hidden_act]
+        
+        # Optional layer norm for stability
+        self.layer_norm = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Raw input of shape [batch_size, seq_len, input_size]
+        
+        Returns:
+            torch.Tensor: Patch embeddings of shape [batch_size, num_patches, hidden_size]
+        """
+        batch_size, seq_len, input_size = x.shape
+        
+        # Calculate number of patches
+        num_patches = seq_len // self.patch_size
+        
+        if num_patches == 0:
+            # If sequence length is smaller than patch size, pad to at least one patch
+            pad_length = self.patch_size - seq_len
+            x_padded = F.pad(x, (0, 0, 0, pad_length), mode='constant', value=0)
+            num_patches = 1
+            truncated_seq_len = self.patch_size
+            x_truncated = x_padded
+        else:
+            # Truncate sequence to make it divisible by patch_size
+            truncated_seq_len = num_patches * self.patch_size
+            x_truncated = x[:, :truncated_seq_len, :]
+        
+        # Reshape to group sequences into patches
+        # [batch_size, num_patches, patch_size, input_size]
+        patches = x_truncated.view(batch_size, num_patches, self.patch_size, input_size)
+        
+        # Flatten each patch: [batch_size, num_patches, patch_size * input_size]
+        flattened_patches = patches.view(batch_size, num_patches, self.patch_size * input_size)
+        
+        # Combined input + patch embedding with gating mechanism
+        # Similar to TimeMoeInputEmbedding but for patches
+        gate_output = self.act_fn(self.gate_projection(flattened_patches))
+        embed_output = self.patch_projection(flattened_patches)
+        patch_embeddings = gate_output * embed_output
+        
+        # Apply layer normalization
+        patch_embeddings = self.layer_norm(patch_embeddings)
         
         return patch_embeddings
 
@@ -1114,11 +1208,23 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__(config)
-        self.embed_layer = TimeMoeInputEmbedding(config)
-
+        
         self.patch_size = config.patch_size
+        patch_embedding_type = getattr(config, 'patch_embedding_type', 'transformer')
+        
+        # Only create input embedding layer when needed
+        # Linear patch embedding processes raw input directly, so no input embedding needed
+        if self.patch_size <= 1 or patch_embedding_type != 'linear':
+            self.embed_layer = TimeMoeInputEmbedding(config)
+        else:
+            self.embed_layer = None
+
         if self.patch_size > 1:
-            self.patch_embedding = TimeMoePatchEmbedding(config)
+            # Choose patch embedding type based on configuration
+            if patch_embedding_type == 'linear':
+                self.patch_embedding = TimeMoeLinearPatchEmbedding(config)
+            else:
+                self.patch_embedding = TimeMoePatchEmbedding(config)
 
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1179,14 +1285,29 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_layer(input_ids)
+            # For linear patch embedding, process raw input directly
+            # For transformer patch embedding, use traditional input embedding first
+            if self.patch_size > 1 and getattr(self.config, 'patch_embedding_type', 'transformer') == 'linear':
+                # Skip input embedding - patch embedding will handle raw input directly
+                inputs_embeds = input_ids
+            else:
+                # Traditional approach: input embedding first
+                if self.embed_layer is not None:
+                    inputs_embeds = self.embed_layer(input_ids)
+                else:
+                    raise ValueError("Input embedding layer is not available but required for this configuration")
 
         # Store original sequence length for attention mask computation
         original_seq_length = seq_length
 
         if self.patch_size > 1:
             # Apply patch embedding
-            inputs_embeds = self.patch_embedding(inputs_embeds)
+            if getattr(self.config, 'patch_embedding_type', 'transformer') == 'linear':
+                # Linear patch embedding expects raw input [batch_size, seq_len, input_size]
+                inputs_embeds = self.patch_embedding(inputs_embeds)
+            else:
+                # Transformer patch embedding expects embedded input [batch_size, seq_len, hidden_size]
+                inputs_embeds = self.patch_embedding(inputs_embeds)
 
         # Update sequence length after patching
         batch_size, seq_length, _ = inputs_embeds.shape

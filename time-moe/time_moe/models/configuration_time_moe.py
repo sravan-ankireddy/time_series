@@ -10,6 +10,7 @@ class TimeMoeConfig(PretrainedConfig):
             self,
             input_size: int = 1,
             patch_size: int = 16,
+            patch_embedding_type: str = "linear",  # "transformer" or "linear"
             num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
@@ -34,6 +35,7 @@ class TimeMoeConfig(PretrainedConfig):
     ):
         self.input_size = input_size
         self.patch_size = patch_size
+        self.patch_embedding_type = patch_embedding_type
         self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -61,6 +63,10 @@ class TimeMoeConfig(PretrainedConfig):
         self.router_aux_loss_factor = router_aux_loss_factor
 
         assert self.use_dense ^ self.apply_aux_loss, 'Both use_dense and apply_aux_loss cannot be set to True or False at the same time.'
+
+        # Validate patch embedding type
+        if patch_embedding_type not in ["linear", "transformer"]:
+            raise ValueError(f"patch_embedding_type must be either 'linear' or 'transformer', got '{patch_embedding_type}'")
 
         kwargs.pop('tie_word_embeddings', None)
         super().__init__(

@@ -631,6 +631,224 @@ class TimeMoeLinearPatchEmbedding(nn.Module):
         return patch_embeddings
 
 
+class TimeMoeLinearUnpatchify(nn.Module):
+    """
+    Unpatchify module that projects patch embeddings back to point embeddings.
+    
+    This module reverses the patching operation by expanding each patch embedding
+    into multiple point embeddings, enabling fine-grained temporal predictions.
+    
+    For the linear patch embedding case, this module:
+    1. Takes patch embeddings of shape [batch_size, num_patches, hidden_size]
+    2. Projects each patch embedding to patch_size point embeddings
+    3. Outputs point embeddings of shape [batch_size, seq_len, hidden_size]
+    
+    This allows the model to make predictions at the original temporal resolution
+    rather than just at the patch level.
+    """
+    
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.hidden_size = config.hidden_size
+        
+        # Project each patch embedding to patch_size point embeddings
+        # Input: [hidden_size] -> Output: [patch_size * hidden_size]
+        self.unpatch_projection = nn.Linear(
+            self.hidden_size,
+            self.patch_size * self.hidden_size,
+            bias=True
+        )
+        
+        # Optional layer norm for stability
+        self.layer_norm = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
+        
+    def forward(self, patch_embeddings, original_seq_len=None):
+        """
+        Args:
+            patch_embeddings (torch.Tensor): Patch embeddings of shape [batch_size, num_patches, hidden_size]
+            original_seq_len (int, optional): Original sequence length before patching
+                                            If None, uses num_patches * patch_size
+        
+        Returns:
+            torch.Tensor: Point embeddings of shape [batch_size, seq_len, hidden_size]
+        """
+        batch_size, num_patches, hidden_size = patch_embeddings.shape
+        
+        # Project patch embeddings to point embeddings
+        # [batch_size, num_patches, patch_size * hidden_size]
+        unpatch_output = self.unpatch_projection(patch_embeddings)
+        
+        # Reshape to separate patch_size dimension
+        # [batch_size, num_patches, patch_size, hidden_size]
+        unpatch_reshaped = unpatch_output.view(
+            batch_size, num_patches, self.patch_size, hidden_size
+        )
+        
+        # Flatten to get point embeddings
+        # [batch_size, num_patches * patch_size, hidden_size]
+        point_embeddings = unpatch_reshaped.view(
+            batch_size, num_patches * self.patch_size, hidden_size
+        )
+        
+        # Truncate to original sequence length if specified
+        if original_seq_len is not None and original_seq_len < point_embeddings.size(1):
+            point_embeddings = point_embeddings[:, :original_seq_len, :]
+        
+        # Apply layer normalization
+        point_embeddings = self.layer_norm(point_embeddings)
+        
+        return point_embeddings
+
+
+class TimeMoeTransformerUnpatchify(nn.Module):
+    """
+    Transformer-based unpatchify module for sophisticated patch-to-point reconstruction.
+    
+    This module uses a more sophisticated approach than the linear unpatchify, leveraging
+    transformer layers to learn complex relationships between patch embeddings and their
+    constituent point embeddings. This is particularly useful when the patch embeddings
+    have been refined through complex cross-attention mechanisms.
+    
+    Architecture:
+    1. Initial linear projection: patch_embedding -> patch_size point embeddings
+    2. Transformer refinement: Use self-attention to refine point embeddings within each patch
+    3. Optional cross-patch attention: Allow point embeddings to attend across patch boundaries
+    4. Final layer normalization
+    
+    For transformer patch embedding case, this module:
+    1. Takes patch embeddings of shape [batch_size, num_patches, hidden_size]
+    2. Projects each patch to patch_size initial point embeddings
+    3. Applies transformer layers for sophisticated reconstruction
+    4. Outputs refined point embeddings of shape [batch_size, seq_len, hidden_size]
+    """
+    
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        self.config = config
+        self.patch_size = config.patch_size
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = min(config.num_attention_heads, 8)  # Limit for efficiency
+        self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
+        
+        # Initial projection from patch embedding to point embeddings
+        self.initial_projection = nn.Linear(
+            self.hidden_size,
+            self.patch_size * self.hidden_size,
+            bias=True
+        )
+        
+        # Transformer layers for point embedding refinement
+        self.num_refinement_layers = 2  # Use 2 layers for sophisticated reconstruction
+        
+        # Self-attention for point embeddings within each patch
+        self.point_attention_layers = nn.ModuleList([
+            TimeMoeAttention(config, layer_idx=i) for i in range(self.num_refinement_layers)
+        ])
+        
+        # Layer normalization for each refinement layer
+        self.point_layer_norms = nn.ModuleList([
+            TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps) 
+            for _ in range(self.num_refinement_layers)
+        ])
+        
+        # Feed-forward networks for point refinement
+        self.point_ffns = nn.ModuleList([
+            TimeMoeTemporalBlock(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.hidden_size * 2,  # Smaller expansion for efficiency
+                hidden_act=config.hidden_act
+            ) for _ in range(self.num_refinement_layers)
+        ])
+        
+        # Final output layer normalization
+        self.final_layer_norm = TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        
+        # Optional: Cross-patch attention (allow points to attend across patch boundaries)
+        self.use_cross_patch_attention = True
+        if self.use_cross_patch_attention:
+            self.cross_patch_attention = TimeMoeAttention(config, layer_idx=self.num_refinement_layers)
+            self.cross_patch_norm = TimeMoeRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        
+    def forward(self, patch_embeddings, original_seq_len=None):
+        """
+        Args:
+            patch_embeddings (torch.Tensor): Patch embeddings of shape [batch_size, num_patches, hidden_size]
+            original_seq_len (int, optional): Original sequence length before patching
+        
+        Returns:
+            torch.Tensor: Refined point embeddings of shape [batch_size, seq_len, hidden_size]
+        """
+        batch_size, num_patches, hidden_size = patch_embeddings.shape
+        
+        # Step 1: Initial projection to point embeddings
+        # [batch_size, num_patches, patch_size * hidden_size]
+        initial_points = self.initial_projection(patch_embeddings)
+        
+        # Reshape to separate point dimension
+        # [batch_size, num_patches, patch_size, hidden_size]
+        initial_points = initial_points.view(batch_size, num_patches, self.patch_size, hidden_size)
+        
+        # Flatten for processing: [batch_size, num_patches * patch_size, hidden_size]
+        point_embeddings = initial_points.view(batch_size, num_patches * self.patch_size, hidden_size)
+        
+        # Step 2: Refinement through transformer layers
+        for layer_idx in range(self.num_refinement_layers):
+            # Self-attention within reconstructed points
+            residual = point_embeddings
+            point_embeddings = self.point_layer_norms[layer_idx](point_embeddings)
+            
+            # Apply attention (no causal mask for unpatchify - we want bidirectional)
+            attention_output = self.point_attention_layers[layer_idx](
+                hidden_states=point_embeddings,
+                attention_mask=None,  # No masking for reconstruction
+                position_ids=None,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False
+            )
+            
+            if isinstance(attention_output, tuple):
+                attention_output = attention_output[0]
+            
+            # Residual connection
+            point_embeddings = residual + attention_output
+            
+            # Feed-forward refinement
+            residual = point_embeddings
+            point_embeddings = self.point_ffns[layer_idx](point_embeddings)
+            point_embeddings = residual + point_embeddings
+        
+        # Step 3: Optional cross-patch attention
+        if self.use_cross_patch_attention:
+            residual = point_embeddings
+            point_embeddings = self.cross_patch_norm(point_embeddings)
+            
+            cross_patch_output = self.cross_patch_attention(
+                hidden_states=point_embeddings,
+                attention_mask=None,
+                position_ids=None,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False
+            )
+            
+            if isinstance(cross_patch_output, tuple):
+                cross_patch_output = cross_patch_output[0]
+            
+            point_embeddings = residual + cross_patch_output
+        
+        # Step 4: Final normalization
+        point_embeddings = self.final_layer_norm(point_embeddings)
+        
+        # Step 5: Truncate to original sequence length if needed
+        if original_seq_len is not None and original_seq_len < point_embeddings.size(1):
+            point_embeddings = point_embeddings[:, :original_seq_len, :]
+        
+        return point_embeddings
+
+
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
 class TimeMoeRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -1225,6 +1443,17 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 self.patch_embedding = TimeMoeLinearPatchEmbedding(config)
             else:
                 self.patch_embedding = TimeMoePatchEmbedding(config)
+        
+        # Create unpatchify module based on configuration
+        if config.use_unpatchify and self.patch_size > 1:
+            if patch_embedding_type == 'linear':
+                # Add unpatchify module for linear patch embedding to project back to point embeddings
+                self.unpatchify = TimeMoeLinearUnpatchify(config)
+            else:
+                # Add transformer-based unpatchify for sophisticated reconstruction
+                self.unpatchify = TimeMoeTransformerUnpatchify(config)
+        else:
+            self.unpatchify = None
 
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1391,6 +1620,18 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 next_decoder_cache = layer_outputs[2]
 
         hidden_states = self.norm(hidden_states)
+        
+        # Apply unpatchify if using linear patch embedding
+        # This projects patch embeddings back to point embeddings for fine-grained predictions
+        if self.unpatchify is not None:
+            # Store the patch-level sequence length
+            patch_seq_len = hidden_states.shape[1]
+            
+            # Calculate original sequence length before patching
+            original_seq_len = getattr(self, '_original_seq_length', patch_seq_len * self.patch_size)
+            
+            # Project patch embeddings back to point embeddings
+            hidden_states = self.unpatchify(hidden_states, original_seq_len)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1600,7 +1841,8 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             shift_labels = labels
 
         # If patch_size > 1, we need to sample labels at patch boundaries
-        if patch_size > 1:
+        # Skip this sampling if unpatchify is enabled, as the model outputs point-level predictions
+        if patch_size > 1 and not getattr(self.config, 'use_unpatchify', False):
             seq_len = predictions.shape[1]
             max_start_pos = seq_len * patch_size - 1 
             patch_starts = torch.arange(0, max_start_pos + 1, patch_size, device=labels.device)

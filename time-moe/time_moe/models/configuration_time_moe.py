@@ -11,6 +11,7 @@ class TimeMoeConfig(PretrainedConfig):
             input_size: int = 1,
             patch_size: int = 16,
             patch_embedding_type: str = "linear",  # "transformer" or "linear"
+            use_unpatchify: bool = True,  # Whether to use unpatchify module
             num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
@@ -36,6 +37,7 @@ class TimeMoeConfig(PretrainedConfig):
         self.input_size = input_size
         self.patch_size = patch_size
         self.patch_embedding_type = patch_embedding_type
+        self.use_unpatchify = use_unpatchify
         self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

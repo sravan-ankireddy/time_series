@@ -61,17 +61,23 @@ class TimeMoE:
         
         try:
             from time_moe.models.modeling_time_moe import TimeMoeForPrediction
+            from time_moe.models.configuration_time_moe import TimeMoeConfig
+            
+            # Load local config instead of HuggingFace config
+            config = TimeMoeConfig.from_pretrained(model_path)
+            
             model = TimeMoeForPrediction.from_pretrained(
                 model_path,
+                config=config,  # Use local config
                 device_map=device,
-                attn_implementation='flash_attention_2',
+                # attn_implementation='flash_attention_2',
                 torch_dtype='auto',
             )
-        except:
+        except: 
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 device_map=device,
-                attn_implementation='flash_attention_2',
+                # attn_implementation='flash_attention_2',
                 torch_dtype='auto',
                 trust_remote_code=True,
             )
@@ -463,7 +469,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--model', '-m',
         type=str,
-        default='/home/sa53869/time-series/model_weights/time-moe-200m',
+        default='/home/sa53869/time-series/model_weights/time-moe-50m',
         help='Model path'
     )
     parser.add_argument(
@@ -493,7 +499,7 @@ if __name__ == '__main__':
         '--downsample_rates',
         type=int,
         nargs='+',
-        default=[1, 2, 4, 8],
+        default=[1],
         help='List of downsampling rates to evaluate (e.g., 1 2 4 8)'
     )
     parser.add_argument(

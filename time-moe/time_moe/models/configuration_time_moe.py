@@ -9,10 +9,10 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 1,
-            patch_embedding_type: str = "linear",  # "transformer" or "linear"
-            use_unpatchify: bool = True,  # Whether to use unpatchify module
-            num_patching_layers: int = 2,  # Number of cross-attention layers in transformer unpatchify
+            patch_size: int = 4,
+            patch_embedding_type: str = "transformer",  # "transformer" or "linear"
+            use_unpatchify: bool = False,  # Whether to use unpatchify module
+            num_patching_layers: int = 2,  # Number of cross-attention layers in patching
             num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
@@ -33,6 +33,7 @@ class TimeMoeConfig(PretrainedConfig):
             apply_aux_loss: bool = True,
             router_aux_loss_factor: float = 0.02,
             tie_word_embeddings: bool = False,
+            local_attention_window_size: int = 4,  # Window size for local self-attention
             **kwargs,
     ):
         self.input_size = input_size
@@ -65,6 +66,7 @@ class TimeMoeConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.apply_aux_loss = apply_aux_loss
         self.router_aux_loss_factor = router_aux_loss_factor
+        self.local_attention_window_size = local_attention_window_size
 
         assert self.use_dense ^ self.apply_aux_loss, 'Both use_dense and apply_aux_loss cannot be set to True or False at the same time.'
 

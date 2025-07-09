@@ -202,14 +202,14 @@ class TimeMoeLocalSelfAttention(nn.Module):
     Local self-attention module for point embeddings with sliding window.
     """
     
-    def __init__(self, config: TimeMoeConfig, window_size: int = 4):
+    def __init__(self, config: TimeMoeConfig, window_size: int = None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_patch_attention_heads  # Use num_patch_attention_heads for local attention
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
-        self.window_size = window_size
+        self.window_size = window_size if window_size is not None else config.local_attention_window_size
         
         # Self-attention projections for point embeddings
         self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=True)
@@ -337,9 +337,9 @@ class TimeMoeCrossAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            x: point embeddings [batch_size, seq_len, dim] - Queries
-            kv: patch embeddings [batch_size, num_patches, dim] - Keys and Values
-            mask: attention mask (unused for unpatchify)
+            x: patch embeddings [batch_size, num_patches, dim] - Queries
+            kv: point embeddings [batch_size, num_patches * patch_size, dim] - Keys and Values
+            mask: attention mask for controlling patch-to-point attention
         """
         bsz, seq_len, _ = x.shape
         _, num_kv, _ = kv.shape
@@ -348,9 +348,9 @@ class TimeMoeCrossAttention(nn.Module):
         kv_norm = self.cross_attn_norm_kv(kv)
 
         # Cross-attention projections
-        xq = self.wq(x)        # queries from point embeddings
-        xk = self.wk(kv_norm)  # keys from patch embeddings
-        xv = self.wv(kv_norm)  # values from patch embeddings
+        xq = self.wq(x)        # queries from patch embeddings
+        xk = self.wk(kv_norm)  # keys from point embeddings
+        xv = self.wv(kv_norm)  # values from point embeddings
 
         # Reshape for multi-head attention
         xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
@@ -366,6 +366,10 @@ class TimeMoeCrossAttention(nn.Module):
         
         # Compute attention scores
         attn_weights = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # Apply attention mask if provided
+        if mask is not None:
+            attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)  # Broadcast for batch and heads
         
         # Apply softmax with consistent dtype
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=xv.dtype)
@@ -380,10 +384,10 @@ class TimeMoeCrossAttention(nn.Module):
         
         return output
     
-    def create_cross_attention_causal_mask(self, num_patches, patch_size, device):
+    def create_cross_attention_mask(self, num_patches, patch_size, device):
         """
-        Create causal mask for cross-attention between patches and points.
-        Each patch can only attend to points from the same patch and previous patches.
+        Create mask for cross-attention between patches and points.
+        Each patch can only attend to points from its own corresponding patch.
         """
         patch_seq_len = num_patches
         point_seq_len = num_patches * patch_size
@@ -392,8 +396,8 @@ class TimeMoeCrossAttention(nn.Module):
         mask = torch.zeros(patch_seq_len, point_seq_len, device=device)
         
         for patch_idx in range(num_patches):
-            # Each patch can attend to all points from current and previous patches
-            start_point = 0
+            # Each patch can only attend to points from its own corresponding patch
+            start_point = patch_idx * patch_size
             end_point = (patch_idx + 1) * patch_size
             mask[patch_idx, start_point:end_point] = 1.0
         
@@ -432,7 +436,7 @@ class TimeMoeCrossAttentionLayer(nn.Module):
         # Local self-attention for point embeddings (only if not final layer)
         # Similar to BLT's pattern where final layer doesn't need to update point embeddings
         if not is_final_layer:
-            self.point_local_attention = TimeMoeLocalSelfAttention(config, window_size=4)
+            self.point_local_attention = TimeMoeLocalSelfAttention(config)
         else:
             self.point_local_attention = None
     
@@ -453,8 +457,8 @@ class TimeMoeCrossAttentionLayer(nn.Module):
         # [batch_size, num_patches * patch_size, hidden_size]
         point_embeddings_flat = point_embeddings.view(batch_size, num_patches * patch_size, hidden_size)
         
-        # Create causal mask for cross-attention
-        cross_mask = self.cross_attention.create_cross_attention_causal_mask(
+        # Create mask for cross-attention: each patch attends only to its own point embeddings
+        cross_mask = self.cross_attention.create_cross_attention_mask(
             num_patches, patch_size, patch_embeddings.device
         )
         

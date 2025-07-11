@@ -1,26 +1,183 @@
+# local enc-- p4 bs 256 ml1024 linear fixed
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m ./logs_local_enc_linear/p4_bf16_bs256_ml1024_v1/time_moe/checkpoint-64200 -o logs_local_enc_linear/p4_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m logs_local_enc_linear/fixed_patch/p16_bf16_bs256_ml1024/time_moe/checkpoint-15500 --max_samples 100
+
+
+# local enc-- p4 bs 256 ml1024 xformer fixed clean
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 8999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 4 -p 64 -c 1024 -m logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-700 --max_samples 100
+
+
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_fixed/p16_bf16_bs256_ml1024/time_moe/checkpoint-2800 --max_samples 100
+
+
+# local enc-- p4 bs 256 ml1024 xformer variable
+
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer/variable_patch/p16_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 16 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+
+
+
+
+
+
+
+
+
+
 ### patching
 
 
-python create_entropy_based_patches.py --csv_path ./datasets/entropy_signal.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+python create_entropy_based_patches.py --csv_path ../datasets/time-moe-eval/entropy_signal.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
 
-python create_entropy_based_patches.py --csv_path ./datasets/ETT-small/ETTm2.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
+python create_entropy_based_patches.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
 
-python create_entropy_based_patches.py --csv_path ./datasets/electricity.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
-
-
+python create_entropy_based_patches.py --csv_path ../datasets/time-moe-eval/electricity.csv --column 1 --bins 4096 --use_global --global_data_path /home/sa53869/time-moe/datasets/gift-eval --use_huggingface
 
 
-### debug 
 
-NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 1024 --global_batch_size 1024 --micro_batch_size 2 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+#### eval with patching 
 
+# ref 
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m ../model_weights/time-moe/TimeMoE-50M --max_samples 100
+
+
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 2048 -m ./logs_local_enc/p16_bf16_bs256/time_moe/checkpoint-38000 --max_samples 100
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 2048 -m ./logs_local_enc_linear/p16_bf16_bs256/time_moe/checkpoint-500 --max_samples 100
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe/checkpoint-41300 --max_samples 100
+
+
+# local enc xformer, bs256 ml1024 patch_size 4
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_xformer/p4_bf16_bs256_ml1024/time_moe/checkpoint-39000 --max_samples 100 --gpu 0
+
+
+# local enc dec linear
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 2048 -m ./logs_local_enc_dec_linear/p16_bf16_bs256/time_moe/checkpoint-36000 --max_samples 100 --gpu 0
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 2048 -m ./logs_local_enc_dec_linear/p4_bf16_bs256/time_moe/checkpoint-3000 --max_samples 100 --gpu 0
+
+
+# local enc linear
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 2048 -m ./logs_local_enc_linear/p16_bf16_bs256/time_moe/checkpoint-32000 --max_samples 100 --gpu 0
+
+
+
+### debug with gpu
+TORCH_DISTRIBUTED_DEBUG=DETAIL CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 1024 --global_batch_size 1024 --micro_batch_size 4 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+### debug with cpu
 python main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 1024 --global_batch_size 1024 --micro_batch_size 2 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+
 
 ## training 
 
-NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_linear_1_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 108 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_patch_project_linear/p16_bf16 --max_length 4096 --global_batch_size 1024 --micro_batch_size 108 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
 
-NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_linear_1_p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_patch_project_xformer/p16_bf16 --max_length 4096 --global_batch_size 1024 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_new/linear_1_p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+
+# local enc -- bs 256
+
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 20 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+# local enc -- bs 256 linear
+
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+# local enc -- bs 256 linear, patch 4, max length 1024
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+# local enc-dec-- bs 256 linear
+
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+# local enc-dec-- bs 256 linear, patch 4, max length 1024
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
+
+# local enc-dec-- bs 256 xformer
+
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 16 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec/p16_bf16_bs256/time_moe --max_length 4096 --global_batch_size 256 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
+
+
+
+
+### ref model bs 256, max len 1024, patch size 1
+
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_ref/p1_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 8 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_ref/p1_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 252 --micro_batch_size 42 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
+
+### training with smaller batch size and smaller max length 
+
+## xformer enc bs256 ml1024
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 86 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 128 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+## linear enc bs256 ml1024
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+## linear enc-dec bs256 ml1024
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 96 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
+
+
+
+
+
+
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_patch_project_conv/p16_bf16 --max_length 4096 --global_batch_size 512 --micro_batch_size 48 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+
+
+
+
+
+
+
 
 ## TACC commands 
 
@@ -35,9 +192,19 @@ python torch_dist_run_tacc.py main.py --warmup_steps 10000 --train_steps 100000 
 
 
 
-python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_vista/linear_1_p8_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 384 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+## Vista
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_patch_project_xformer/p16_bf16 --max_length 4096 --global_batch_size 1024 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 --dataloader_num_workers 4
+
+python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_patch_project_linear/p8_bf16 --max_length 4096 --global_batch_size 1024 --micro_batch_size 176 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 --dataloader_num_workers 4
+
+
 
 python torch_dist_run_vista.py main.py --warmup_steps 10000 --train_steps 100000 -d /scratch/09004/sravana/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_vista/linear_1_p8_p16_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 256 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2 
+
+
+
 
 
 ## entropy patching 

@@ -11,9 +11,10 @@ class TimeMoeConfig(PretrainedConfig):
             input_size: int = 1,
             patch_size: int = 4,
             patching_strategy: str = "fixed",  # "fixed" or "adaptive"
-            patch_embedding_type: str = "transformer",  # "transformer" or "linear"
-            use_unpatchify: bool = False,  # Whether to use unpatchify module
-            num_patching_layers: int = 2,  # Number of cross-attention layers in patching
+            patch_embedding_type: str = "linear",  # "transformer" or "linear"
+            use_unpatchify: bool = True,  # Whether to use unpatchify module
+            num_patchify_layers: int = 4, 
+            num_unpatchify_layers: int = 4,
             num_patch_attention_heads: int = 2,
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
@@ -42,7 +43,8 @@ class TimeMoeConfig(PretrainedConfig):
         self.patching_strategy = patching_strategy  # "fixed" or "adaptive"
         self.patch_embedding_type = patch_embedding_type
         self.use_unpatchify = use_unpatchify
-        self.num_patching_layers = num_patching_layers
+        self.num_patchify_layers = num_patchify_layers
+        self.num_unpatchify_layers = num_unpatchify_layers
         self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

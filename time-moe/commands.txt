@@ -1,18 +1,33 @@
 # local enc-- p4 bs 256 ml1024 linear fixed
 
-CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/time_moe --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_linear/p4_bf16_bs256_ml1024/ --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
 
-CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m ./logs_local_enc_linear/p4_bf16_bs256_ml1024_v1/time_moe/checkpoint-64200 -o logs_local_enc_linear/p4_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --save_steps 100 --save_strategy steps --save_total_limit 2
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m /home/sa53869/time_series/time-moe/logs_local_enc_linear/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-88300 -o /home/sa53869/time_series/time-moe/logs_local_enc_linear/fixed_patches/p16_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --save_steps 100 --save_strategy steps --save_total_limit 2
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 64 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_linear/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-90200 --max_samples 100
 
 
-python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m logs_local_enc_linear/fixed_patch/p16_bf16_bs256_ml1024/time_moe/checkpoint-15500 --max_samples 100
+# local enc dec -- p4 bs 256 ml1024 linear fixed
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_dec_linear/p4_bf16_bs256_ml1024/ --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 64 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_linear/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-90200 --max_samples 100
+
 
 
 # local enc-- p4 bs 256 ml1024 xformer fixed clean
 
-CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 8999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
-python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 4 -p 64 -c 1024 -m logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-700 --max_samples 100
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 8999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2
 
+
+CUDA_VISIBLE_DEVICES=0,1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py --port 8999 main.py --warmup_steps 10000 --train_steps 100000 -d /mnt/Data/datasets/Time-300B -m /home/sa53869/time_series/time-moe/logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024/checkpoint-52000 -o logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 64 --precision bf16 --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m logs_local_enc_xformer_clean/fixed_patches/p16_bf16_bs256_ml1024 --max_samples 100
+
+# eval ref
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 64 -p 64 -c 1024 -m /home/sa53869/time_series/model_weights/time-moe/TimeMoE-50M
 
 
 python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m /home/sa53869/time_series/time-moe/logs_local_enc_fixed/p16_bf16_bs256_ml1024/time_moe/checkpoint-2800 --max_samples 100

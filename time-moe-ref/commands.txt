@@ -1,0 +1,16 @@
+# ref
+CUDA_VISIBLE_DEVICES=0,1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d ../../datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_ref/p1_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 16 --precision bf16 --from_scratch --save_steps 100 --save_strategy steps --save_total_limit 2
+
+
+CUDA_VISIBLE_DEVICES=0,1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d ../../datasets/Time-300B -m /home/sa53869/time-series/time-moe-ref/logs_ref/p1_bf16_bs256_ml1024/checkpoint-74000 -o logs_ref/p1_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 16 --precision bf16 --save_steps 1000 --save_strategy steps --save_total_limit 2
+
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 16 -p 64 -c 1024 -m ./logs_ref/p1_bf16_bs256_ml1024/checkpoint-99000 --max_samples 100
+
+
+# eval ref
+
+python run_eval_without_si.py -d ../datasets/time-moe-eval/ETT-small/ETTm2.csv -b 4 -p 64 -c 1024 -m /home/sa53869/time-series/model_weights/time-moe/TimeMoE-50M --max_samples 100
+
+
+CUDA_VISIBLE_DEVICES=0,1 python torch_dist_run.py --port 9999 main.py --warmup_steps 10000 --train_steps 100000 -d ../../datasets/Time-300B -m ./logs_ref/p1_bf16_bs256_ml1024/checkpoint-44000 -o logs_ref/p1_bf16_bs256_ml1024 --max_length 1024 --global_batch_size 256 --micro_batch_size 16 --precision bf16 --save_steps 10000 --save_strategy steps --save_total_limit 2

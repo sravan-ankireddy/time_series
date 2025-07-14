@@ -9,7 +9,154 @@ import os
 from tqdm import tqdm
 
 
-def autoregressive_predict_context_simplified(pipeline, ground_truth_context, dataset_mean, max_context_length=None):
+def count_series_in_tsf_file(file_path):
+    """Count the number of time series in a TSF file.
+    
+    Args:
+        file_path: Path to the TSF file
+    
+    Returns:
+        Number of time series found in the file
+    """
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    
+    # Find the @data section
+    data_section_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith('@data'):
+            data_section_start = i + 1
+            break
+    
+    if data_section_start is None:
+        return 0
+    
+    series_count = 0
+    for i in range(data_section_start, len(lines)):
+        line = lines[i].strip()
+        if not line:  # Skip empty lines
+            continue
+            
+        if ':' in line:
+            parts = line.split(':')
+            if len(parts) >= 4:  # TSF format: series_id:location:timestamp:data
+                data_part = parts[-1]
+                try:
+                    # Check if we can parse at least one value
+                    values = []
+                    for x in data_part.split(','):
+                        x = x.strip()
+                        if x:
+                            values.append(float(x))
+                    
+                    if len(values) > 0:
+                        series_count += 1
+                except ValueError:
+                    continue
+    
+    return series_count
+
+
+def parse_tsf_file(file_path, series_index=0):
+    """Parse a TSF (Time Series Format) file and extract time series data.
+    
+    Args:
+        file_path: Path to the TSF file
+        series_index: Index of the time series to extract (0-based)
+    
+    Returns:
+        numpy array containing the time series values
+    """
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    
+    # Find the @data section
+    data_section_start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith('@data'):
+            data_section_start = i + 1
+            break
+    
+    if data_section_start is None:
+        raise ValueError("Could not find @data section in TSF file")
+    
+    # First, count total series to provide better error messages
+    total_series = count_series_in_tsf_file(file_path)
+    print(f"Found {total_series} time series in TSF file")
+    
+    if series_index >= total_series:
+        raise ValueError(f"Requested series index {series_index} is out of range. "
+                        f"File contains {total_series} time series (indices 0 to {total_series-1})")
+    
+    # Parse time series data
+    series_data = []
+    current_series = 0
+    
+    for i in range(data_section_start, len(lines)):
+        line = lines[i].strip()
+        if not line:  # Skip empty lines
+            continue
+            
+        # Each line contains: series_id:location:timestamp:data_values
+        # Example: T1:NSW:2002-01-01 00-00-00:5714.045004,5360.189078,...
+        if ':' in line:
+            # Split line to get the data part (last part after final colon)
+            parts = line.split(':')
+            if len(parts) >= 4:  # TSF format: series_id:location:timestamp:data
+                # The time series values are in the last part, comma-separated
+                data_part = parts[-1]
+                try:
+                    # Parse comma-separated values, filter out empty strings
+                    values = []
+                    for x in data_part.split(','):
+                        x = x.strip()
+                        if x:  # Only process non-empty strings
+                            values.append(float(x))
+                    
+                    if len(values) > 0:  # Only count series with actual data
+                        if current_series == series_index:
+                            series_data = values
+                            break
+                        current_series += 1
+                except ValueError as e:
+                    # Skip lines that don't contain valid numeric data
+                    print(f"Warning: Could not parse line {i}: {e}")
+                    continue
+    if not series_data:
+        raise ValueError(f"Could not find time series at index {series_index} in TSF file")
+    
+    return np.array(series_data)
+
+
+def load_time_series_data(file_path, series_index=0):
+    """Load time series data from either CSV or TSF file format.
+    
+    Args:
+        file_path: Path to the data file (.csv or .tsf)
+        series_index: For CSV files, this is the column index (0-based).
+                     For TSF files, this is the time series index (0-based).
+    
+    Returns:
+        numpy array containing the time series values
+    """
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if file_extension == '.csv':
+        # Load CSV file using pandas
+        df = pd.read_csv(file_path)
+        if series_index >= len(df.columns):
+            raise ValueError(f"Column index {series_index} is out of range for the CSV file")
+        return df.iloc[:, series_index].values
+    
+    elif file_extension == '.tsf':
+        # Load TSF file using custom parser
+        return parse_tsf_file(file_path, series_index)
+    
+    else:
+        raise ValueError(f"Unsupported file format: {file_extension}. Supported formats: .csv, .tsf")
+
+
+def autoregressive_predict_context_simplified(pipeline, ground_truth_context, dataset_mean, max_context_length=None, entropy_batch=128):
     """Predict context autoregressively and compute entropy from token probabilities.
     
     Args:
@@ -17,6 +164,7 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
         ground_truth_context: The ground truth time series data
         dataset_mean: Mean value of the dataset for initial context
         max_context_length: Maximum context length to use (if None, uses unbounded context until reaching model's max context, then sliding window)
+        entropy_batch: Number of samples to process in each batch
     
     Returns:
         predictions: Array of predicted values
@@ -32,7 +180,9 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
     # This ensures we use sliding window approach for threshold optimization too
     effective_max_context = max_context_length if max_context_length is not None else 1024
     
-    for i in tqdm(range(context_length), desc="Predicting samples"):
+    # Create all contexts for batch processing
+    contexts = []
+    for i in range(context_length):
         if i == 0:
             # Use dataset mean for first prediction context
             context = torch.tensor([dataset_mean], dtype=torch.float32)
@@ -45,35 +195,43 @@ def autoregressive_predict_context_simplified(pipeline, ground_truth_context, da
             else:
                 # Use all available context from 0 to i-1 (growing window)
                 context = torch.tensor(ground_truth_context[:i], dtype=torch.float32)
+        contexts.append(context)
+    
+    # Process contexts in batches
+    for batch_start in tqdm(range(0, context_length, entropy_batch), desc="Processing batches"):
+        batch_end = min(batch_start + entropy_batch, context_length)
+        batch_contexts = contexts[batch_start:batch_end]
         
         # Get predictions with logits for entropy computation
-        preds, logits = pipeline.predict(
-            context=context,
+        batch_preds, batch_logits = pipeline.predict(
+            context=batch_contexts,
             prediction_length=1,  # Predict one step ahead
             num_samples=1,
             return_logits=True
         )
-
-        # Extract logits for the predicted token
-        token_logits = logits[0, 0, 0, :]  # Shape: [vocab_size]
-        probs = torch.softmax(token_logits, dim=-1)
-
-        # Store logits for vocabulary analysis
-        all_logits.append(token_logits.cpu().numpy())
         
-        # Compute entropy: H(X) = -sum(p(x) * log2(p(x)))
-        entropy = -torch.sum(probs * torch.log2(probs + 1e-10)).item()
-        entropies.append(entropy)
-        
-        # Get the predicted token for this timestep
-        predicted_token = preds[0, 0, 0].item()
-        predictions.append(predicted_token)
+        # Process each sample in the batch
+        for i in range(len(batch_contexts)):
+            # Extract logits for the predicted token
+            token_logits = batch_logits[i, 0, 0, :]  # Shape: [vocab_size]
+            probs = torch.softmax(token_logits, dim=-1)
+
+            # Store logits for vocabulary analysis
+            all_logits.append(token_logits.cpu().numpy())
+            
+            # Compute entropy: H(X) = -sum(p(x) * log2(p(x)))
+            entropy = -torch.sum(probs * torch.log2(probs + 1e-10)).item()
+            entropies.append(entropy)
+            
+            # Get the predicted token for this timestep
+            predicted_token = batch_preds[i, 0, 0].item()
+            predictions.append(predicted_token)
     
     return np.array(predictions), np.array(entropies), all_logits
 
 
 def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_size=5, 
-                               relative_entropy_mode=False, fixed_threshold=None):
+                               relative_entropy_mode=False, fixed_threshold=None, max_patch_size=None):
     """
     Detect patch boundaries based on entropy spikes.
     
@@ -83,6 +241,7 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
         min_patch_size: Minimum size of a patch
         relative_entropy_mode: If True, use Relative Entropy (diff-based)
         fixed_threshold: If not None, use this fixed threshold instead of calculating one
+        max_patch_size: Maximum size of a patch (if None, no maximum limit)
     
     Returns:
         patch_boundaries: List of patch boundary indices
@@ -137,6 +296,26 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
             patch_boundaries.append(spike_idx)
             current_patch_start = spike_idx
     
+    # Enforce maximum patch size by adding additional boundaries if needed
+    if max_patch_size is not None:
+        final_boundaries = [patch_boundaries[0]]  # Start with first boundary
+        
+        for i in range(1, len(patch_boundaries)):
+            current_start = final_boundaries[-1]
+            current_end = patch_boundaries[i]
+            
+            # If the patch is too large, split it
+            while current_end - current_start > max_patch_size:
+                # Add a boundary at max_patch_size from current start
+                new_boundary = current_start + max_patch_size
+                final_boundaries.append(new_boundary)
+                current_start = new_boundary
+            
+            # Add the original boundary
+            final_boundaries.append(current_end)
+        
+        patch_boundaries = final_boundaries
+    
     # Add final boundary
     if len(entropies) - 1 not in patch_boundaries:
         patch_boundaries.append(len(entropies) - 1)
@@ -144,7 +323,7 @@ def detect_patches_from_entropy(entropies, threshold_multiplier=1.5, min_patch_s
     return patch_boundaries, threshold
 
 
-def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relative_entropy_mode=False, max_iterations=1000):
+def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relative_entropy_mode=False, max_iterations=1000, max_patch_size=None):
     """
     Find the optimal threshold that produces patches with the target average size.
     
@@ -154,6 +333,7 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relat
         min_patch_size: Minimum size of a patch
         relative_entropy_mode: If True, use Relative Entropy (diff-based)
         max_iterations: Maximum number of iterations to find optimal threshold
+        max_patch_size: Maximum size of a patch (if None, no maximum limit)
     
     Returns:
         optimal_threshold: The threshold that produces patches closest to target size
@@ -185,7 +365,8 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relat
         # Test current threshold
         patch_boundaries, _ = detect_patches_from_entropy(
             entropies, threshold_multiplier=None, min_patch_size=min_patch_size, 
-            relative_entropy_mode=relative_entropy_mode, fixed_threshold=current_threshold
+            relative_entropy_mode=relative_entropy_mode, fixed_threshold=current_threshold,
+            max_patch_size=max_patch_size
         )
         
         num_patches = len(patch_boundaries) - 1
@@ -227,7 +408,8 @@ def find_optimal_threshold(entropies, target_patch_size, min_patch_size=5, relat
     # Return best threshold found
     patch_boundaries, _ = detect_patches_from_entropy(
         entropies, threshold_multiplier=None, min_patch_size=min_patch_size,
-        relative_entropy_mode=relative_entropy_mode, fixed_threshold=best_threshold
+        relative_entropy_mode=relative_entropy_mode, fixed_threshold=best_threshold,
+        max_patch_size=max_patch_size
     )
     num_patches = len(patch_boundaries) - 1
     final_avg_patch_size = len(entropies) / num_patches if num_patches > 0 else len(entropies)
@@ -248,7 +430,7 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
         dataset_avg_patch_sizes: Dict with average patch sizes for both modes
         args: Command line arguments
     """
-    import matplotlib.pyplot as plt
+    
     
     # Ensure entropies is a list
     if isinstance(entropies, np.ndarray):
@@ -263,7 +445,8 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
         for mode_name, is_relative in [('absolute_entropy', False), ('relative_entropy', True)]:
             patch_boundaries, _ = detect_patches_from_entropy(
                 entropy_array, threshold_multiplier=None, min_patch_size=args.min_patch_size,
-                relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name]
+                relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name],
+                max_patch_size=args.max_patch_size
             )
             
             # Calculate individual patch sizes
@@ -324,19 +507,19 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
     
     plt.tight_layout()
     
-    # Get dataset name from CSV path
-    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
+    # Get dataset name from data path
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     
     # Save histogram
-    base_name = f"patch_size_histogram_{dataset_name}_col{args.col_num}"
+    base_name = f"patch_size_histogram_{dataset_name}_series{args.series_index}"
     
     # Save as PNG
-    png_path = f"results_entropy/{dataset_name}/col_{args.col_num}/{base_name}.png"
+    png_path = f"results_entropy/{dataset_name}/series_{args.series_index}/{base_name}.png"
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
     plt.savefig(png_path, dpi=300, bbox_inches='tight')
     
     # Save as PDF
-    pdf_path = f"results_entropy/{dataset_name}/col_{args.col_num}/{base_name}.pdf"
+    pdf_path = f"results_entropy/{dataset_name}/series_{args.series_index}/{base_name}.pdf"
     plt.savefig(pdf_path, bbox_inches='tight')
     
     plt.close()
@@ -355,7 +538,7 @@ def create_patch_size_histogram(entropies, optimal_thresholds, dataset_avg_patch
             print(f"  {mode_name.title()} mode: No patches found")
 
 
-def create_vocabulary_distribution_plots(entropies, all_logits, args):
+def create_vocabulary_distribution_plots(entropies, all_logits, args, ground_truth_series=None, pipeline=None):
     """
     Create plots showing vocabulary probability distributions for high and low entropy points.
     
@@ -363,16 +546,18 @@ def create_vocabulary_distribution_plots(entropies, all_logits, args):
         entropies: Array of entropy values
         all_logits: List of logits for each timestep
         args: Command line arguments
+        ground_truth_series: Optional ground truth series to show actual values
+        pipeline: The Chronos pipeline for tokenization
     """
-    import matplotlib.pyplot as plt
+    
     
     # Find 3 points with lowest entropy and 3 points with highest entropy
     entropy_indices = np.argsort(entropies)
     low_entropy_indices = entropy_indices[:3]
     high_entropy_indices = entropy_indices[-3:]
     
-    # Get dataset name from CSV path
-    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
+    # Get dataset name from data path
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     
     # Create plots for low entropy points
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -391,7 +576,28 @@ def create_vocabulary_distribution_plots(entropies, all_logits, args):
         y_values = probs[start_idx:end_idx]
         
         axes[i].bar(x_range, y_values, alpha=0.7, color='blue')
-        axes[i].set_title(f'Point {idx}: Entropy = {entropies[idx]:.3f}', fontsize=18)
+        
+        # Add ground truth information if available
+        if ground_truth_series is not None and idx < len(ground_truth_series):
+            gt_value = ground_truth_series[idx]
+            # Convert ground truth value to vocabulary token using the pipeline's tokenizer
+            gt_token_tensor = torch.tensor([gt_value], dtype=torch.float32).unsqueeze(0)
+            try:
+                # Use the pipeline to get the vocabulary token for the ground truth value
+                gt_tokens = pipeline.tokenizer.encode(gt_token_tensor)
+                gt_token_idx = gt_tokens[0, 0].item() if len(gt_tokens.shape) > 1 else gt_tokens[0].item()
+                title = f'Point {idx}: Entropy = {entropies[idx]:.3f}\nGT Value = {gt_value:.4f}, GT Token = {gt_token_idx}'
+                
+                # Mark the ground truth token on the plot
+                axes[i].axvline(x=gt_token_idx, color='green', linestyle='-', linewidth=3, alpha=0.8, 
+                               label=f'GT Token {gt_token_idx}')
+            except:
+                # Fallback if tokenization fails
+                title = f'Point {idx}: Entropy = {entropies[idx]:.3f}\nGT Value = {gt_value:.4f}'
+        else:
+            title = f'Point {idx}: Entropy = {entropies[idx]:.3f}'
+            
+        axes[i].set_title(title, fontsize=18)
         axes[i].set_xlabel('Vocabulary Index', fontsize=18)
         axes[i].set_ylabel('Probability', fontsize=18)
         axes[i].grid(True, alpha=0.3)
@@ -404,8 +610,8 @@ def create_vocabulary_distribution_plots(entropies, all_logits, args):
     plt.tight_layout()
     
     # Save low entropy plot
-    low_entropy_path_png = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_low_entropy.png"
-    low_entropy_path_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_low_entropy.pdf"
+    low_entropy_path_png = f"results_entropy/{dataset_name}/series_{args.series_index}/vocab_dist_low_entropy.png"
+    low_entropy_path_pdf = f"results_entropy/{dataset_name}/series_{args.series_index}/vocab_dist_low_entropy.pdf"
     os.makedirs(os.path.dirname(low_entropy_path_png), exist_ok=True)
     plt.savefig(low_entropy_path_png, dpi=600, bbox_inches='tight')
     plt.savefig(low_entropy_path_pdf, bbox_inches='tight')
@@ -428,7 +634,28 @@ def create_vocabulary_distribution_plots(entropies, all_logits, args):
         y_values = probs[start_idx:end_idx]
         
         axes[i].bar(x_range, y_values, alpha=0.7, color='red')
-        axes[i].set_title(f'Point {idx}: Entropy = {entropies[idx]:.3f}', fontsize=18)
+        
+        # Add ground truth information if available
+        if ground_truth_series is not None and idx < len(ground_truth_series):
+            gt_value = ground_truth_series[idx]
+            # Convert ground truth value to vocabulary token using the pipeline's tokenizer
+            gt_token_tensor = torch.tensor([gt_value], dtype=torch.float32).unsqueeze(0)
+            try:
+                # Use the pipeline to get the vocabulary token for the ground truth value
+                gt_tokens = pipeline.tokenizer.encode(gt_token_tensor)
+                gt_token_idx = gt_tokens[0, 0].item() if len(gt_tokens.shape) > 1 else gt_tokens[0].item()
+                title = f'Point {idx}: Entropy = {entropies[idx]:.3f}\nGT Value = {gt_value:.4f}, GT Token = {gt_token_idx}'
+                
+                # Mark the ground truth token on the plot
+                axes[i].axvline(x=gt_token_idx, color='green', linestyle='-', linewidth=3, alpha=0.8, 
+                               label=f'GT Token {gt_token_idx}')
+            except:
+                # Fallback if tokenization fails
+                title = f'Point {idx}: Entropy = {entropies[idx]:.3f}\nGT Value = {gt_value:.4f}'
+        else:
+            title = f'Point {idx}: Entropy = {entropies[idx]:.3f}'
+            
+        axes[i].set_title(title, fontsize=18)
         axes[i].set_xlabel('Vocabulary Index', fontsize=18)
         axes[i].set_ylabel('Probability', fontsize=18)
         axes[i].grid(True, alpha=0.3)
@@ -441,8 +668,8 @@ def create_vocabulary_distribution_plots(entropies, all_logits, args):
     plt.tight_layout()
     
     # Save high entropy plot
-    high_entropy_path_png = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_high_entropy.png"
-    high_entropy_path_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/vocab_dist_high_entropy.pdf"
+    high_entropy_path_png = f"results_entropy/{dataset_name}/series_{args.series_index}/vocab_dist_high_entropy.png"
+    high_entropy_path_pdf = f"results_entropy/{dataset_name}/series_{args.series_index}/vocab_dist_high_entropy.pdf"
     plt.savefig(high_entropy_path_png, dpi=600, bbox_inches='tight')
     plt.savefig(high_entropy_path_pdf, bbox_inches='tight')
     plt.close()
@@ -458,7 +685,7 @@ def create_multi_resolution_plots(all_ground_truths, all_predictions, all_entrop
     """
     Create plots at multiple resolutions (1/4, 1/2, full context) for each chunk.
     """
-    import matplotlib.pyplot as plt
+    
     
     modes = {'absolute_entropy': False, 'relative_entropy': True}
     resolutions = [('quarter', 0.25), ('half', 0.5), ('full', 1.0)]
@@ -604,10 +831,10 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
         dataset_avg_patch_sizes: Dict with average patch sizes for both modes
         args: Command line arguments
     """
-    import matplotlib.pyplot as plt
     
-    # Get dataset name from CSV path
-    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
+    
+    # Get dataset name from data path
+    dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     
     modes = {'absolute_entropy': False, 'relative_entropy': True}
     
@@ -647,7 +874,8 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
             # Detect and plot patch boundaries
             patch_boundaries, _ = detect_patches_from_entropy(
                 entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size,
-                relative_entropy_mode=is_relative, fixed_threshold=threshold_val
+                relative_entropy_mode=is_relative, fixed_threshold=threshold_val,
+                max_patch_size=args.max_patch_size
             )
             
             # Plot patch boundaries
@@ -688,8 +916,8 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
     plt.tight_layout()
     
     # Save plot with signal overlay
-    with_signal_png = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_with_signal.png"
-    with_signal_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_with_signal.pdf"
+    with_signal_png = f"results_entropy/{dataset_name}/series_{args.series_index}/full_dataset_with_signal.png"
+    with_signal_pdf = f"results_entropy/{dataset_name}/series_{args.series_index}/full_dataset_with_signal.pdf"
     os.makedirs(os.path.dirname(with_signal_png), exist_ok=True)
     plt.savefig(with_signal_png, dpi=600, bbox_inches='tight')
     plt.savefig(with_signal_pdf, bbox_inches='tight')
@@ -727,7 +955,8 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
             # Detect and plot patch boundaries
             patch_boundaries, _ = detect_patches_from_entropy(
                 entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size,
-                relative_entropy_mode=is_relative, fixed_threshold=threshold_val
+                relative_entropy_mode=is_relative, fixed_threshold=threshold_val,
+                max_patch_size=args.max_patch_size
             )
             
             # Plot patch boundaries
@@ -764,8 +993,8 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
     plt.tight_layout()
     
     # Save plot without signal overlay
-    without_signal_png = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_entropy_only.png"
-    without_signal_pdf = f"results_entropy/{dataset_name}/col_{args.col_num}/full_dataset_entropy_only.pdf"
+    without_signal_png = f"results_entropy/{dataset_name}/series_{args.series_index}/full_dataset_entropy_only.png"
+    without_signal_pdf = f"results_entropy/{dataset_name}/series_{args.series_index}/full_dataset_entropy_only.pdf"
     plt.savefig(without_signal_png, dpi=600, bbox_inches='tight')
     plt.savefig(without_signal_pdf, bbox_inches='tight')
     plt.close()
@@ -775,77 +1004,77 @@ def create_full_dataset_plots(series, entropies, all_logits, optimal_thresholds,
     print(f"  Entropy only: {without_signal_png} and {without_signal_pdf}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Autoregressive prediction with entropy-based patches for 3 random chunks. Creates Absolute Entropy H(x_i) and Relative Entropy H(x_i) - H(x_{i-1}) visualizations including full dataset plots.')
-    parser.add_argument('--csv_path', type=str, 
-                        default='../datasets/time-moe-eval/ETT-small/ETTm2.csv',
-                        help='Path to the CSV file containing the time series data')
-    parser.add_argument('--col_num', type=int, default=1, 
-                        help='Column number (0-indexed) to process')
-    parser.add_argument('--context_length', type=int, default=1024, 
-                        help='Length of context to predict autoregressively')
-    parser.add_argument('--model', type=str, default='../model_weights/chronos/chronos-t5-small',
-                        help='Chronos model to use for prediction')
-    parser.add_argument('--threshold_multiplier', type=float, default=1.5,
-                        help='Multiplier for mean+std to determine spike threshold (ignored if target_patch_size is set)')
-    parser.add_argument('--target_patch_size', type=int, default=8,
-                        help='Target average patch size. If set, will automatically find optimal threshold.')
-    parser.add_argument('--threshold_search_k', type=int, default=None,
-                        help='Number of samples to use for threshold search. If not set, uses entire dataset.')
-    parser.add_argument('--min_patch_size', type=int, default=1,
-                        help='Minimum size of a patch')
-    parser.add_argument('--gpu', type=int, default=None,
-                        help='GPU ID to use. If not specified, uses CPU. Example: --gpu 0')
-    parser.add_argument('--max_iterations', type=int, default=1000,
-                        help='Maximum number of iterations for threshold optimization (default: 1000)')
-    args = parser.parse_args()
+def get_data_files(data_path):
+    """Get list of data files to process.
+    
+    Args:
+        data_path: Path to either a file or directory
+        
+    Returns:
+        List of file paths to process
+    """
+    if os.path.isfile(data_path):
+        # Single file
+        return [data_path]
+    elif os.path.isdir(data_path):
+        # Directory - find all CSV and TSF files
+        files = []
+        for filename in os.listdir(data_path):
+            filepath = os.path.join(data_path, filename)
+            if os.path.isfile(filepath) and filename.lower().endswith(('.csv', '.tsf')):
+                files.append(filepath)
+        return sorted(files)  # Sort for consistent ordering
+    else:
+        raise FileNotFoundError(f"Path not found: {data_path}")
 
-    # Load data
-    if not os.path.exists(args.csv_path):
-        raise FileNotFoundError(f"CSV file not found: {args.csv_path}")
-    df = pd.read_csv(args.csv_path)
-    if args.col_num >= len(df.columns):
-        raise ValueError(f"Column number {args.col_num} is out of range for the CSV file")
-    series = df.iloc[:, args.col_num].values
 
-    # Validate threshold_search_k argument
-    if args.threshold_search_k is not None:
-        if args.threshold_search_k <= 0:
-            raise ValueError("threshold_search_k must be positive")
-        if args.threshold_search_k > len(series):
-            raise ValueError(f"threshold_search_k ({args.threshold_search_k}) cannot be larger than dataset size ({len(series)})")
-        if args.target_patch_size is None:
-            print("Warning: threshold_search_k specified but target_patch_size not set. threshold_search_k will be ignored.")
+def process_single_file(file_path, args, pipeline, dataset_mean=None):
+    """Process a single data file.
+    
+    Args:
+        file_path: Path to the data file
+        args: Command line arguments
+        pipeline: The loaded Chronos pipeline
+        dataset_mean: Precomputed dataset mean (if None, will compute from file)
+        
+    Returns:
+        None (saves results to disk)
+    """
+    print(f"\n{'='*80}")
+    print(f"PROCESSING FILE: {file_path}")
+    print(f"{'='*80}")
+    
+    try:
+        series = load_time_series_data(file_path, args.series_index)
+        file_type = "TSF" if file_path.lower().endswith('.tsf') else "CSV"
+        print(f"Loaded {file_type} file: {file_path}")
+        print(f"Using series index: {args.series_index}")
+        print(f"Time series length: {len(series)}")
+    except Exception as e:
+        print(f"ERROR: Could not load file {file_path}: {str(e)}")
+        return
 
-    # Calculate dataset mean
-    dataset_mean = np.mean(series)
+    # Calculate dataset mean if not provided
+    if dataset_mean is None:
+        dataset_mean = np.mean(series)
     print(f"Dataset mean: {dataset_mean:.4f}")
 
-    # Load model
-    if args.gpu is not None:
-        if torch.cuda.is_available():
-            if args.gpu < torch.cuda.device_count():
-                device = f"cuda:{args.gpu}"
-            else:
-                print(f"Warning: GPU {args.gpu} not available. Available GPUs: 0-{torch.cuda.device_count()-1}. Using CPU instead.")
-                device = "cpu"
-        else:
-            print("Warning: CUDA not available. Using CPU instead.")
-            device = "cpu"
-    else:
-        device = "cpu"
-    print(f"Loading model {args.model} on {device}...")
-    pipeline = BaseChronosPipeline.from_pretrained(
-        args.model,
-        device_map=device,
-        torch_dtype=torch.bfloat16,
-    )
-
+    # Validate data length
+    if len(series) < args.context_length:
+        print(f"WARNING: Time series too short ({len(series)}) for context length {args.context_length}. Skipping file.")
+        return
+    
     # Select 3 random chunks of context_length
     max_start = len(series) - args.context_length
     if max_start < 3:
-        raise ValueError(f"Time series too short for 3 chunks of length {args.context_length}")
-    random_starts = random.sample(range(max_start), 3)
+        print(f"WARNING: Time series too short for 3 chunks of length {args.context_length}. Using fewer chunks.")
+        num_chunks = max(1, max_start + 1)
+        if num_chunks == 1:
+            random_starts = [0]
+        else:
+            random_starts = random.sample(range(max_start + 1), min(3, num_chunks))
+    else:
+        random_starts = random.sample(range(max_start), 3)
 
     # If target patch size is specified, compute entropy for dataset to find optimal thresholds
     optimal_thresholds = {'absolute_entropy': None, 'relative_entropy': None}
@@ -864,25 +1093,29 @@ def main():
         
         # Compute entropy for the search series (using sliding window approach for threshold optimization)
         _, search_entropies, search_logits = autoregressive_predict_context_simplified(
-            pipeline, search_series, dataset_mean, max_context_length=args.context_length)
+            pipeline, search_series, dataset_mean, max_context_length=args.context_length, entropy_batch=args.entropy_batch)
 
         # Find optimal thresholds for both modes
         print("\n--- Finding optimal threshold for Absolute Entropy mode ---")
         optimal_thresholds['absolute_entropy'], dataset_avg_patch_sizes['absolute_entropy'], abs_iterations = find_optimal_threshold(
             search_entropies, args.target_patch_size, args.min_patch_size, 
-            relative_entropy_mode=False, max_iterations=args.max_iterations
+            relative_entropy_mode=False, max_iterations=args.max_iterations, max_patch_size=args.max_patch_size
         )
         
         print("\n--- Finding optimal threshold for Relative Entropy mode ---")
         optimal_thresholds['relative_entropy'], dataset_avg_patch_sizes['relative_entropy'], rel_iterations = find_optimal_threshold(
             search_entropies, args.target_patch_size, args.min_patch_size, 
-            relative_entropy_mode=True, max_iterations=args.max_iterations
+            relative_entropy_mode=True, max_iterations=args.max_iterations, max_patch_size=args.max_patch_size
         )
         
         print(f"\nOptimal thresholds found:")
         print(f"  Absolute Entropy mode: {optimal_thresholds['absolute_entropy']:.4f} (dataset avg size: {dataset_avg_patch_sizes['absolute_entropy']:.1f})")
         print(f"  Relative Entropy mode: {optimal_thresholds['relative_entropy']:.4f} (dataset avg size: {dataset_avg_patch_sizes['relative_entropy']:.1f})")
         print(f"Threshold search performed on: {search_description}")
+        
+        # Update args.data_path temporarily for this file to ensure correct paths in plots
+        original_data_path = args.data_path
+        args.data_path = file_path
         
         # Create histogram of patch size distribution for both modes
         print("\nCreating patch size distribution histograms...")
@@ -891,12 +1124,15 @@ def main():
         
         # Create vocabulary distribution plots
         print("\nCreating vocabulary distribution plots...")
-        create_vocabulary_distribution_plots(search_entropies, search_logits, args)
+        create_vocabulary_distribution_plots(search_entropies, search_logits, args, search_series, pipeline)
         
         # Create full dataset plots
         print("\nCreating full dataset plots...")
         create_full_dataset_plots(series, search_entropies, search_logits, 
                                 optimal_thresholds, dataset_avg_patch_sizes, args)
+        
+        # Restore original data_path
+        args.data_path = original_data_path
 
     # Generate autoregressive predictions for each chunk
     all_ground_truths = []
@@ -907,10 +1143,10 @@ def main():
     all_thresholds = {'absolute_entropy': [], 'relative_entropy': []}
 
     for i, start in enumerate(random_starts):
-        print(f"\nProcessing chunk {i+1}/3 (start index {start})...")
+        print(f"\nProcessing chunk {i+1}/{len(random_starts)} (start index {start})...")
         ground_truth = series[start:start+args.context_length]
         preds, entropies, logits = autoregressive_predict_context_simplified(
-            pipeline, ground_truth, dataset_mean, max_context_length=args.context_length)
+            pipeline, ground_truth, dataset_mean, max_context_length=args.context_length, entropy_batch=args.entropy_batch)
         
         # Process both modes
         modes = {'absolute_entropy': False, 'relative_entropy': True}
@@ -924,19 +1160,21 @@ def main():
                 # Use the optimal threshold found from full dataset analysis
                 patch_boundaries, threshold = detect_patches_from_entropy(
                     entropies, threshold_multiplier=None, min_patch_size=args.min_patch_size, 
-                    relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name]
+                    relative_entropy_mode=is_relative, fixed_threshold=optimal_thresholds[mode_name],
+                    max_patch_size=args.max_patch_size
                 )
             else:
                 # Use traditional threshold calculation
                 patch_boundaries, threshold = detect_patches_from_entropy(
-                    entropies, args.threshold_multiplier, args.min_patch_size, is_relative
+                    entropies, args.threshold_multiplier, args.min_patch_size, is_relative,
+                    max_patch_size=args.max_patch_size
                 )
             
             all_patch_boundaries[mode_name].append(patch_boundaries)
             all_thresholds[mode_name].append(threshold)
             
             patch_count = len(patch_boundaries) - 1
-            avg_chunk_patch_size = args.context_length / patch_count if patch_count > 0 else args.context_length
+            avg_chunk_patch_size = len(entropies) / patch_count if patch_count > 0 else len(entropies)
             
             if optimal_thresholds[mode_name] is not None:
                 print(f"    Entropy-based patches: {patch_count} with optimal threshold {threshold:.4f}")
@@ -950,12 +1188,17 @@ def main():
         all_predictions.append(preds)
         all_entropies.append(entropies)
         all_logits.append(logits)
+    
     # Create results directory structure
-    dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
-    results_dir = f"results_entropy/{dataset_name}/col_{args.col_num}"
+    dataset_name = os.path.splitext(os.path.basename(file_path))[0]
+    results_dir = f"results_entropy/{dataset_name}/series_{args.series_index}"
     os.makedirs(results_dir, exist_ok=True)
     
     print(f"\n=== Creating multi-resolution plots ===")
+    
+    # Update args.data_path temporarily for this file to ensure correct paths in plots
+    original_data_path = args.data_path
+    args.data_path = file_path
     
     # Create plots at multiple resolutions for each chunk
     create_multi_resolution_plots(all_ground_truths, all_predictions, all_entropies,
@@ -976,7 +1219,7 @@ def main():
         mode_display = "ABSOLUTE ENTROPY" if mode_name == 'absolute_entropy' else "RELATIVE ENTROPY"
         print(f"\n--- {mode_display} MODE ---")
         
-        for i in range(3):
+        for i in range(len(random_starts)):
             mae = np.mean(np.abs(all_ground_truths[i] - all_predictions[i]))
             mse = np.mean((all_ground_truths[i] - all_predictions[i]) ** 2)
             rmse = np.sqrt(mse)
@@ -986,10 +1229,122 @@ def main():
             patch_boundaries = all_patch_boundaries[mode_name][i]
             threshold_val = all_thresholds[mode_name][i]
             patch_count = len(patch_boundaries) - 1
-            avg_patch_size = args.context_length / patch_count if patch_count > 0 else args.context_length
+            avg_patch_size = len(all_entropies[i]) / patch_count if patch_count > 0 else len(all_entropies[i])
             
             print(f"Chunk {i+1}: MAE={mae:.4f}, RMSE={rmse:.4f}")
             print(f"         Entropy: Avg={avg_entropy:.4f} bits, Patches={patch_count}, Avg Patch Size={avg_patch_size:.1f}, Threshold={threshold_val:.4f}")
+    
+    # Restore original data_path
+    args.data_path = original_data_path
+    
+    print(f"\nCompleted processing file: {file_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Autoregressive prediction with entropy-based patches for 3 random chunks. Creates Absolute Entropy H(x_i) and Relative Entropy H(x_i) - H(x_{i-1}) visualizations including full dataset plots.')
+    parser.add_argument('--data_path', type=str, 
+                        default='../datasets/time-moe-eval/ETT-small/ETTm2.csv',
+                        help='Path to a data file (CSV or TSF format) or directory containing data files')
+    parser.add_argument('--series_index', type=int, default=1, 
+                        help='Series index (0-based): For CSV files, this is the column number. For TSF files, this is the time series index.')
+    parser.add_argument('--context_length', type=int, default=1024, 
+                        help='Length of context to predict autoregressively')
+    parser.add_argument('--model', type=str, default='../model_weights/chronos/chronos-t5-small',
+                        help='Chronos model to use for prediction')
+    parser.add_argument('--threshold_multiplier', type=float, default=1.5,
+                        help='Multiplier for mean+std to determine spike threshold (ignored if target_patch_size is set)')
+    parser.add_argument('--target_patch_size', type=int, default=8,
+                        help='Target average patch size. If set, will automatically find optimal threshold.')
+    parser.add_argument('--threshold_search_k', type=int, default=None,
+                        help='Number of samples to use for threshold search. If not set, uses entire dataset.')
+    parser.add_argument('--min_patch_size', type=int, default=4,
+                        help='Minimum size of a patch')
+    parser.add_argument('--max_patch_size', type=int, default=16,
+                        help='Maximum size of a patch')
+    parser.add_argument('--gpu', type=int, default=None,
+                        help='GPU ID to use. If not specified, uses CPU. Example: --gpu 0')
+    parser.add_argument('--max_iterations', type=int, default=1000,
+                        help='Maximum number of iterations for threshold optimization (default: 1000)')
+    parser.add_argument('--entropy_batch', type=int, default=128,
+                        help='Number of samples to process in each batch for entropy computation (default: 128)')
+    
+    # Add backward compatibility for old argument names
+    parser.add_argument('--csv_path', type=str, 
+                        help='Deprecated: Use --data_path instead. Path to the CSV file containing the time series data')
+    parser.add_argument('--col_num', type=int, 
+                        help='Deprecated: Use --series_index instead. Column number (0-indexed) to process')
+    
+    args = parser.parse_args()
+
+    # Handle backward compatibility
+    if args.csv_path is not None:
+        print("Warning: --csv_path is deprecated. Use --data_path instead.")
+        args.data_path = args.csv_path
+    if args.col_num is not None:
+        print("Warning: --col_num is deprecated. Use --series_index instead.")
+        args.series_index = args.col_num
+
+    # Get list of files to process
+    if not os.path.exists(args.data_path):
+        raise FileNotFoundError(f"Path not found: {args.data_path}")
+    
+    try:
+        data_files = get_data_files(args.data_path)
+        if not data_files:
+            raise ValueError(f"No CSV or TSF files found in: {args.data_path}")
+        
+        print(f"Found {len(data_files)} file(s) to process:")
+        for i, file_path in enumerate(data_files, 1):
+            print(f"  {i}. {file_path}")
+        
+    except Exception as e:
+        raise ValueError(f"Error finding data files: {str(e)}")
+
+    # Validate threshold_search_k argument (will be validated per file)
+    if args.threshold_search_k is not None and args.threshold_search_k <= 0:
+        raise ValueError("threshold_search_k must be positive")
+    if args.target_patch_size is None and args.threshold_search_k is not None:
+        print("Warning: threshold_search_k specified but target_patch_size not set. threshold_search_k will be ignored.")
+
+    # Load model - default to CPU unless GPU ID is explicitly provided
+    if args.gpu is not None:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            if args.gpu < torch.cuda.device_count():
+                device = f"cuda:{args.gpu}"
+                print(f"Using GPU {args.gpu} as requested")
+            else:
+                print(f"Warning: GPU {args.gpu} not available. Available GPUs: 0-{torch.cuda.device_count()-1}. Using CPU instead.")
+                device = "cpu"
+        else:
+            print("Warning: CUDA not available. Using CPU instead.")
+            device = "cpu"
+    else:
+        device = "cpu"
+        print("Using CPU (default). Specify --gpu <id> to use GPU.")
+    print(f"Loading model {args.model} on {device}...")
+    pipeline = BaseChronosPipeline.from_pretrained(
+        args.model,
+        device_map=device,
+        torch_dtype=torch.bfloat16,
+    )
+
+    # Process each file
+    for file_idx, file_path in enumerate(data_files, 1):
+        print(f"\n{'#'*80}")
+        print(f"PROCESSING FILE {file_idx}/{len(data_files)}: {os.path.basename(file_path)}")
+        print(f"{'#'*80}")
+        
+        try:
+            process_single_file(file_path, args, pipeline)
+        except Exception as e:
+            print(f"ERROR processing file {file_path}: {str(e)}")
+            print(f"Continuing with next file...")
+            continue
+    
+    print(f"\n{'='*80}")
+    print(f"COMPLETED PROCESSING ALL FILES")
+    print(f"Successfully processed files from: {args.data_path}")
+    print(f"{'='*80}")
 
 
 if __name__ == '__main__':

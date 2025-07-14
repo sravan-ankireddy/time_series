@@ -1,16 +1,1 @@
-python run_inference_ar_si_quantiles.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --col_num 1
-
-python create_patches_with_si.py --csv_path ../datasets/entropy_signal.csv --col_num 1
-
-
-python create_patches_with_si.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --col_num 1
-
-python create_patches_with_si.py --csv_path ../datasets/time-moe-eval/electricity.csv --col_num 1
-
-
-
-python create_patches_with_entropy.py --csv_path ../datasets/entropy_signal.csv --col_num 1 --gpu 1 
-
-python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/ETT-small/ETTm2.csv --col_num 1 --gpu 1 
- 
-python create_patches_with_entropy.py --csv_path ../datasets/time-moe-eval/electricity.csv --col_num 1 --gpu 0 
+python create_patches_with_entropy.py --data_path ../datasets/monash/ --series_index 1 --context_length 512 --target_patch_size 8 --gpu 1

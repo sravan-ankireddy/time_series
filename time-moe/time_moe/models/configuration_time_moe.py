@@ -11,11 +11,14 @@ class TimeMoeConfig(PretrainedConfig):
             input_size: int = 1,
             patch_size: int = 4,
             patching_strategy: str = "fixed",  # "fixed" or "adaptive"
-            patch_embedding_type: str = "linear",  # "transformer" or "linear"
+            patch_embedding_type: str = "transformer",  # "transformer" or "linear"
             use_unpatchify: bool = True,  # Whether to use unpatchify module
-            num_patchify_layers: int = 4, 
-            num_unpatchify_layers: int = 4,
-            num_patch_attention_heads: int = 2,
+            num_patchify_layers: int = 2, 
+            num_unpatchify_layers: int = 8,
+            num_patch_attention_heads: int = 4,  # Number of attention heads for patch embeddings
+            local_attention_window_size: int = 128,  # Window size for local self-attention
+            entropy_batch_size = 256,  # Batch size for entropy calculations
+            # Model architecture parameters
             hidden_size: int = 4096,
             intermediate_size: int = 22016,
             horizon_lengths: List[int] = 1,
@@ -35,13 +38,14 @@ class TimeMoeConfig(PretrainedConfig):
             apply_aux_loss: bool = True,
             router_aux_loss_factor: float = 0.02,
             tie_word_embeddings: bool = False,
-            local_attention_window_size: int = 4,  # Window size for local self-attention
             **kwargs,
     ):
         self.input_size = input_size
         self.patch_size = patch_size
-        self.patching_strategy = patching_strategy  # "fixed" or "adaptive"
+        self.patching_strategy = patching_strategy
+        self.local_attention_window_size = local_attention_window_size
         self.patch_embedding_type = patch_embedding_type
+        self.entropy_batch_size = entropy_batch_size
         self.use_unpatchify = use_unpatchify
         self.num_patchify_layers = num_patchify_layers
         self.num_unpatchify_layers = num_unpatchify_layers
@@ -70,7 +74,6 @@ class TimeMoeConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.apply_aux_loss = apply_aux_loss
         self.router_aux_loss_factor = router_aux_loss_factor
-        self.local_attention_window_size = local_attention_window_size
 
         assert self.use_dense ^ self.apply_aux_loss, 'Both use_dense and apply_aux_loss cannot be set to True or False at the same time.'
 

@@ -53,12 +53,6 @@ def plot_patches(
 
     Adds average patch size annotation to each zoom segment.
     """
-    # Ensure correct shape
-    if input_ids.ndim != 2:
-        input_ids = input_ids.squeeze()
-    if batch_patch_starts.ndim != 2:
-        batch_patch_starts = batch_patch_starts.squeeze()
-
     # Move to CPU
     if input_ids.is_cuda:
         input_ids = input_ids.cpu()
@@ -306,101 +300,199 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 def compute_entropies(
     input_ids: torch.FloatTensor,
     chronos_pipeline,
-    config
-) -> Tuple[List[List[float]], List[List[float]], List[List[float]], List[List[np.ndarray]]]:
+    config,
+    horizon: int,
+) -> Tuple[torch.LongTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """
-    Compute entropies and relative entropies for time series sequences using autoregressive prediction.
-    
-    This function performs causal cropping to create sequences suitable for autoregressive
-    prediction, processes them in batches for memory efficiency, and computes both absolute
-    entropies and relative entropies from the prediction logits.
-    
-    Args:
-        input_ids: Input time series tensor of shape [batch_size, seq_length, input_size]
-        chronos_pipeline: Chronos pipeline for making predictions
-        config: Model configuration containing entropy_batch_size parameter
-    
+    Compute entropies and relative entropies for time series sequences using autoregressive
+    prediction. Updated to predict `horizon` steps at once and return batch tensors.
+
     Returns:
-        Tuple of (batch_predictions, batch_entropies, batch_relative_entropies, batch_logits):
-        - batch_predictions: List of predictions for each sequence in the batch
-        - batch_entropies: List of absolute entropy values for each sequence in the batch
-        - batch_relative_entropies: List of relative entropy values for each sequence in the batch
-        - batch_logits: List of logits arrays for each sequence in the batch
+        batch_predictions: LongTensor of shape [batch_size, seq_length]
+        batch_entropies: FloatTensor of shape [batch_size, seq_length]
+        batch_relative_entropies: FloatTensor of shape [batch_size, seq_length]
+        batch_logits: FloatTensor of shape [batch_size, seq_length, vocab_size]
     """
-    # Create causally cropped sequences for parallel processing
-    # Pattern: [[mean], [x0], [x0, x1], [x0, x1, x2], ..., [mean], [y0], [y0, y1], ...]
+    # --- 1) build causal contexts ----------
     causal_context_list = []
-    sequence_metadata = []  # Track which sequence and timestep each context belongs to
-    
+    sequence_metadata = []  # (batch_idx, start_timestep)
+
     batch_size, seq_length, _ = input_ids.shape
-    
     for batch_idx in range(batch_size):
-        sequence = input_ids[batch_idx].squeeze(-1).to("cpu")  # [seq_length]
-        sequence_mean = torch.mean(sequence).item()
-        
-        # Create causally cropped versions starting with mean for first prediction
-        for timestep in range(seq_length):  # 0 to seq_length-1
-            if timestep == 0:
-                # Use sequence mean as context to predict x0
-                causal_crop = torch.tensor([sequence_mean], dtype=torch.float32)
+        seq = input_ids[batch_idx].squeeze(-1).to("cpu")
+        seq_mean = seq.mean().unsqueeze(0)
+        for start in range(0, seq_length, horizon):
+            if start == 0:
+                causal_context_list.append(seq_mean.clone())
             else:
-                # Use x0, x1, ..., x_{timestep-1} as context to predict x_timestep
-                causal_crop = sequence[:timestep]  # Progressive causal cropping
-            
-            causal_context_list.append(causal_crop)
-            sequence_metadata.append((batch_idx, timestep))  # (sequence_idx, target_timestep)
-    
-    # Process in batches to avoid memory issues
+                causal_context_list.append(seq[:start].clone())
+            sequence_metadata.append((batch_idx, start))
+
+    # --- 2) run the model in batches -------
     all_preds = []
     all_logits = []
-
     for i in range(0, len(causal_context_list), config.entropy_batch_size):
-        batch_end = min(i + config.entropy_batch_size, len(causal_context_list))
-        batch_contexts = causal_context_list[i:batch_end]
-        
-        # Process this batch
-        batch_preds, batch_logits = chronos_pipeline.predict(
-            context=batch_contexts,
-            prediction_length=1,
+        batch_ctxs = causal_context_list[i : i + config.entropy_batch_size]
+        bp, bl = chronos_pipeline.predict(
+            context=batch_ctxs,
+            prediction_length=horizon,
             num_samples=1,
-            return_logits=True
+            return_logits=True,
         )
-        
-        all_preds.append(batch_preds)
-        all_logits.append(batch_logits)
-    
-    # Concatenate all batches
-    preds = torch.cat(all_preds, dim=0)
-    logits = torch.cat(all_logits, dim=0)
-    
-    # Reorganize results back to batch format
-    batch_predictions = [[] for _ in range(batch_size)]
-    batch_entropies = [[] for _ in range(batch_size)]
-    batch_relative_entropies = [[] for _ in range(batch_size)]
-    batch_logits = [[] for _ in range(batch_size)]
-    
-    for ctx_idx, (batch_idx, timestep) in enumerate(sequence_metadata):
-        # Extract logits and compute entropy for this prediction
-        token_logits = logits[ctx_idx, 0, 0, :]  # Shape: [vocab_size]
-        probs = torch.softmax(token_logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log2(probs + 1e-10)).item()
-        predicted_token = preds[ctx_idx, 0, 0].item()
-        
-        # Store results organized by original batch sequence
-        batch_predictions[batch_idx].append(predicted_token)
-        batch_entropies[batch_idx].append(entropy)
-        batch_logits[batch_idx].append(token_logits.cpu().numpy())
+        all_preds.append(bp)
+        all_logits.append(bl)
 
-        # Compute relative entropies for each sequence
-        if timestep == 0:
-            # First timestep has no previous entropy to compare with
-            relative_entropy = 0.0
+    preds = torch.cat(all_preds, dim=0)   # [num_ctx, 1, horizon]
+    logits = torch.cat(all_logits, dim=0) # [num_ctx, 1, horizon, vocab_size]
+
+    # --- 3) allocate output tensors ------
+    device = preds.device
+    vocab_size = logits.size(-1)
+
+    batch_predictions          = torch.zeros(batch_size, seq_length, dtype=preds.dtype, device=device)
+    batch_entropies            = torch.zeros(batch_size, seq_length, dtype=torch.float32, device=device)
+    batch_relative_entropies   = torch.zeros(batch_size, seq_length, dtype=torch.float32, device=device)
+    batch_logits_tensor        = torch.zeros(batch_size, seq_length, vocab_size, dtype=logits.dtype, device=device)
+
+    # --- 4) scatter per‐context outputs into the batch tensors ---
+    for ctx_idx, (batch_idx, start) in enumerate(sequence_metadata):
+        # how many timesteps are valid at the end?
+        n_steps = min(horizon, seq_length - start)
+        # grab this context’s preds & logits
+        p_slice = preds[ctx_idx, 0, :n_steps]             # [n_steps]
+        l_slice = logits[ctx_idx, 0, :n_steps, :]         # [n_steps, vocab_size]
+
+        # compute entropies
+        probs          = torch.softmax(l_slice, dim=-1)   # [n_steps, vocab_size]
+        entropy_slice  = -torch.sum(probs * torch.log2(probs + 1e-10), dim=-1)  # [n_steps]
+
+        # compute relative entropies
+        rel_slice = torch.empty_like(entropy_slice)
+        if start == 0:
+            rel_slice[0] = 0.0
         else:
-            # Relative entropy = current_entropy - previous_entropy
-            relative_entropy = entropy - batch_entropies[batch_idx][timestep - 1]
-        batch_relative_entropies[batch_idx].append(relative_entropy)
+            prev_ent = batch_entropies[batch_idx, start - 1]
+            rel_slice[0] = entropy_slice[0] - prev_ent
+        if n_steps > 1:
+            rel_slice[1:] = entropy_slice[1:] - entropy_slice[:-1]
 
-    return batch_predictions, batch_entropies, batch_relative_entropies, batch_logits
+        # write into the big tensors
+        batch_predictions[batch_idx, start : start + n_steps]        = p_slice
+        batch_entropies[batch_idx, start : start + n_steps]          = entropy_slice
+        batch_relative_entropies[batch_idx, start : start + n_steps] = rel_slice
+        batch_logits_tensor[batch_idx, start : start + n_steps, :]    = l_slice
+
+    return batch_predictions, batch_entropies, batch_relative_entropies, batch_logits_tensor
+
+@torch.jit.script
+def compute_entropy_based_patches(
+    entropies: torch.Tensor,
+    use_relative_entropies: bool = True,
+    threshold_factor: float = 1.0,
+    min_patch_size: int = 4,
+    max_patch_size: int = 1000000,  # Large default instead of Optional
+    step_size: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    JIT-compiled version for maximum performance.
+    
+    Args:
+        entropies: Batch of entropy sequences as tensor
+                  Shape: [batch_size, seq_length]
+        use_relative_entropies: If True, uses relative entropies; if False, uses absolute entropies
+        threshold_factor: Factor to multiply the computed threshold by. Higher values = larger patches
+        min_patch_size: Minimum allowed patch size
+        max_patch_size: Maximum allowed patch size
+        step_size: Step size for searching patch boundaries
+    
+    Returns:
+        Tuple of (mask, avg_sizes):
+        - mask: Boolean tensor of shape [batch_size, seq_length], True at patch starts
+        - avg_sizes: Tensor of average patch sizes for each sequence [batch_size]
+    """
+    if entropies.numel() == 0:
+        return torch.empty(0, 0, dtype=torch.bool, device=entropies.device), torch.empty(0, device=entropies.device)
+    
+    B, S = entropies.shape
+    device = entropies.device
+    
+    # Initialize output tensors
+    mask = torch.zeros(B, S, dtype=torch.bool, device=device)
+    avg_sizes = torch.zeros(B, device=device)
+    
+    for b in range(B):
+        sequence_entropies = entropies[b]
+        
+        # Compute threshold for this sequence
+        if use_relative_entropies:
+            # For relative entropies: Use robust statistics (percentiles)
+            # Skip the first element which is always 0.0 for relative entropies
+            if S > 1:
+                relevant_entropies = sequence_entropies[1:]
+            else:
+                relevant_entropies = sequence_entropies
+            
+            if relevant_entropies.numel() > 0:
+                q75 = torch.quantile(relevant_entropies, 0.75)
+                q25 = torch.quantile(relevant_entropies, 0.25)
+                iqr = q75 - q25
+                # Use 75th percentile + 0.5 * IQR as threshold
+                sequence_threshold = q75 + 0.5 * iqr
+                # Ensure minimum threshold to avoid too many patches
+                sequence_threshold = max(sequence_threshold.item(), 0.2)
+            else:
+                sequence_threshold = 0.5  # Default fallback
+        else:
+            # For absolute entropies: Use mean + standard deviation
+            mean_entropy = torch.mean(sequence_entropies)
+            std_entropy = torch.std(sequence_entropies)
+            sequence_threshold = mean_entropy + 1.0 * std_entropy
+            sequence_threshold = max(sequence_threshold.item(), 1.0)
+        
+        # Apply threshold factor to control expected patch size
+        sequence_threshold *= threshold_factor
+        
+        # Patch creation logic
+        current_pos = 0
+        size_sum = 0
+        patch_count = 0
+        
+        while current_pos < S:
+            # Mark the start of a new patch
+            mask[b, current_pos] = True
+            
+            min_end = min(current_pos + min_patch_size, S)
+            max_end = min(current_pos + max_patch_size, S)
+            
+            # If there's not even room for min_patch_size, just finish
+            if min_end >= S:
+                size_sum += S - current_pos
+                patch_count += 1
+                break
+            
+            # Search for the first end-point (in steps) whose entropy exceeds threshold
+            patch_end = max_end
+            for end in range(min_end, max_end, step_size):
+                if end > S:
+                    break
+                # Check entropy at this position
+                if sequence_entropies[end - 1] > sequence_threshold:
+                    patch_end = end
+                    break
+            
+            # Accumulate stats and move forward
+            patch_size = patch_end - current_pos
+            size_sum += patch_size
+            patch_count += 1
+            current_pos = patch_end
+        
+        # Record the average patch size for this sequence
+        if patch_count > 0:
+            avg_sizes[b] = float(size_sum) / patch_count
+        else:
+            avg_sizes[b] = 0.0
+    
+    return mask, avg_sizes
 
 @torch.jit.script
 def compute_variance_based_patches(
@@ -579,101 +671,7 @@ def compute_random_patches(
     
     return batch_patch_starts
 
-def compute_patches(
-    entropies: List[List[float]],
-    use_relative_entropies: bool = True,
-    threshold: Optional[float] = None,
-    min_patch_size: int = 4,
-    max_patch_size: int = 8
-) -> Tuple[List[torch.Tensor], List[float]]:
-    """
-    Compute variable-length patches based on entropy thresholds.
-    
-    Creates patches by monitoring entropy values and starting new patches when 
-    entropy exceeds a threshold, indicating potential pattern changes or 
-    increased uncertainty in the time series.
-    
-    Args:
-        entropies: List of entropy sequences, either absolute or relative entropies
-                  Shape: [batch_size][seq_length]
-        use_relative_entropies: If True, uses relative entropies; if False, uses absolute entropies
-        threshold: Entropy threshold for patch boundary detection. If None, computed automatically
-        min_patch_size: Minimum allowed patch size
-        max_patch_size: Maximum allowed patch size
-    
-    Returns:
-        Tuple of (batch_patch_starts, thresholds_used):
-        - batch_patch_starts: List of binary vectors for each sequence 
-                             Each vector is shape [seq_length], 1 at patch start, 0 elsewhere
-        - thresholds_used: List of thresholds used for each sequence
-    """
-    batch_patch_starts = []
-    thresholds_used = []
-    
-    for sequence_entropies in entropies:
-        if len(sequence_entropies) == 0:
-            # Empty sequence - create single patch
-            batch_patch_starts.append(torch.tensor([1], dtype=torch.long))
-            thresholds_used.append(0.0)
-            continue
-        
-        seq_length = len(sequence_entropies)
-        patch_starts = torch.zeros(seq_length, dtype=torch.long)
-        
-        # Convert to numpy for easier computation
-        entropy_array = np.array(sequence_entropies)
-        
-        # Determine threshold for this sequence
-        if threshold is None:
-            if use_relative_entropies:
-                # For relative entropies: Use robust statistics (percentiles)
-                # Skip the first element which is always 0.0 for relative entropies
-                relevant_entropies = entropy_array[1:] if len(entropy_array) > 1 else entropy_array
-                if len(relevant_entropies) > 0:
-                    q75 = np.percentile(relevant_entropies, 75)
-                    q25 = np.percentile(relevant_entropies, 25)
-                    iqr = q75 - q25
-                    # Use 75th percentile + 0.5 * IQR as threshold
-                    sequence_threshold = q75 + 0.5 * iqr
-                    # Ensure minimum threshold to avoid too many patches
-                    sequence_threshold = max(sequence_threshold, 0.2)
-                else:
-                    sequence_threshold = 0.5  # Default fallback
-            else:
-                # For absolute entropies: Use mean + standard deviation
-                mean_entropy = np.mean(entropy_array)
-                std_entropy = np.std(entropy_array)
-                sequence_threshold = mean_entropy + 1.0 * std_entropy
-                sequence_threshold = max(sequence_threshold, 1.0)
-        else:
-            sequence_threshold = threshold
-        
-        thresholds_used.append(sequence_threshold)
-        
-        # Always start with first patch
-        patch_starts[0] = 1
-        current_patch_start = 0
-        
-        i = 1
-        while i < seq_length:
-            current_patch_size = i - current_patch_start
-            
-            # Check if we should start a new patch due to high entropy
-            if (sequence_entropies[i] > sequence_threshold and 
-                current_patch_size >= min_patch_size):
-                patch_starts[i] = 1
-                current_patch_start = i
-            
-            # Force patch boundary if current patch reaches max size
-            elif current_patch_size >= max_patch_size:
-                patch_starts[i] = 1
-                current_patch_start = i
-            
-            i += 1
-        
-        batch_patch_starts.append(patch_starts)
-    
-    return batch_patch_starts, thresholds_used
+
 
 
 
@@ -1859,14 +1857,14 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         else:
             self.embed_layer = None
 
-        # if self.config.patching_strategy == "adaptive":
+        if self.config.patching_strategy == "adaptive":
 
-            # # Use Chronos for computing entropy
-            # self.chronos_pipeline = BaseChronosPipeline.from_pretrained(
-            #     "../model_weights/chronos/chronos-t5-small",
-            #     device_map="cuda:1",#self.device,
-            #     torch_dtype=torch.bfloat16,
-            # )
+            # Use Chronos for computing entropy
+            self.chronos_pipeline = BaseChronosPipeline.from_pretrained(
+                "../model_weights/chronos/chronos-t5-small",
+                device_map="cuda:0",#self.device,
+                torch_dtype=torch.bfloat16,
+            )
 
         if self.patch_size > 1:
             # Choose patch embedding type based on configuration
@@ -1961,37 +1959,24 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if self.config.patch_embedding_type == 'transformer':
             if self.config.patching_strategy == "adaptive":
 
-                # # Get predictions with logits for entropy computation
-                # batch_predictions, batch_entropies, batch_relative_entropies, batch_logits = compute_entropies(
-                #     input_ids, self.chronos_pipeline, self.config
-                # )
+                # Get predictions with logits for entropy computation
+                batch_predictions, batch_entropies, batch_relative_entropies, batch_logits = compute_entropies(input_ids, self.chronos_pipeline, self.config, horizon=4)
+                # breakpoint()
 
-                # # Compute patches based on entropies
-                # batch_patch_starts, thresholds = compute_patches(
-                #     batch_relative_entropies, 
-                #     use_relative_entropies=True,
-                #     min_patch_size=4,
-                #     max_patch_size=8
-                # )
+                # Compute patches based on entropies
+                batch_patch_starts, avg_patch_size = compute_entropy_based_patches(batch_relative_entropies, use_relative_entropies=True, threshold_factor=0.5, min_patch_size=2, max_patch_size=8)
 
-                # batch_patch_starts = compute_random_patches(
-                #     batch_size=batch_size,
-                #     seq_length=seq_length,
-                #     min_patch_size=4,
-                #     max_patch_size=8,
-                #     seed=42  # For reproducible results during testing
-                # )
+                # batch_patch_starts = compute_random_patches(batch_size=batch_size, seq_length=seq_length, min_patch_size=4, max_patch_size=8, seed=42)
 
-                batch_patch_starts, avg_patch_size = compute_variance_based_patches(torch.squeeze(input_ids), threshold_factor=0.02, min_patch_size=4, max_patch_size=8, step_size=8)
+                # batch_patch_starts, avg_patch_size = compute_variance_based_patches(torch.squeeze(input_ids), threshold_factor=0.02, min_patch_size=4, max_patch_size=8, step_size=8)
 
                 # batch_patch_starts, avg_patch_size = compute_diff_based_patches(input_ids, threshold_factor=0.1, min_patch_size=2, max_patch_size=8)
 
-                # plot_patches(input_ids, batch_patch_starts, num_samples=5)
+                # plot_patches(torch.squeeze(input_ids), batch_patch_starts, num_samples=5)
                 # breakpoint()
+
                 # Compute patch embeddings using max pooling over variable-length patches
-                initial_patch_embeds, padding_mask = compute_initial_patch_embeddings_with_pooling(
-                    inputs_embeds, batch_patch_starts, self.config.hidden_size, self.config
-                )
+                initial_patch_embeds, padding_mask = compute_initial_patch_embeddings_with_pooling(inputs_embeds, batch_patch_starts, self.config.hidden_size, self.config)
 
                 # Create attention masks for variable-length patches
                 patch_attention_masks = compute_patch_attention_masks(

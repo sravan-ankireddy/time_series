@@ -10,13 +10,13 @@ class TimeMoeConfig(PretrainedConfig):
             self,
             input_size: int = 1,
             patch_size: int = 4,
-            patching_strategy: str = "fixed",  # "fixed" or "adaptive"
+            patching_strategy: str = "adaptive",  # "fixed" or "adaptive"
             patch_embedding_type: str = "transformer",  # "transformer" or "linear"
             use_unpatchify: bool = True,  # Whether to use unpatchify module
             num_patchify_layers: int = 2, 
-            num_unpatchify_layers: int = 8,
+            num_unpatchify_layers: int = 2,
             num_patch_attention_heads: int = 4,  # Number of attention heads for patch embeddings
-            local_attention_window_size: int = 128,  # Window size for local self-attention
+            local_attention_window_size: int = 32,  # Window size for local self-attention
             entropy_batch_size = 256,  # Batch size for entropy calculations
             # Model architecture parameters
             hidden_size: int = 4096,

@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Any
 import warnings
 
 import torch
@@ -287,13 +287,138 @@ def compute_entropies(
     return batch_predictions, batch_entropies, batch_relative_entropies, batch_logits
 
 
+def compute_threshold_patches(
+    input_sequences: torch.Tensor,
+    threshold_factor: float = 1.0,
+    min_patch_size: int = 1,
+    max_patch_size: Optional[int] = None,
+    seed: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create patches by starting a new patch whenever the variance of the accumulated
+    points exceeds threshold_factor * var(full batch), with optional max size.
+    Uses prefix sums to compute variances in O(1) per check.
+
+    Args:
+        input_sequences: Tensor of shape [B, S]
+        threshold_factor: multiple of the global variance at which to cut a new patch
+        min_patch_size: smallest allowed patch length
+        max_patch_size: largest allowed patch length (None to disable)
+        seed: optional RNG seed
+
+    Returns:
+        mask: Boolean tensor [B, S] marking each patch start
+        avg_patch_sizes: Float tensor [B] with the mean patch length per sequence
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    if input_sequences.ndim != 2:
+        input_sequences = torch.squeeze(input_sequences)
+
+    # Ensure shape [B, S]
+    if input_sequences.ndim != 2:
+        input_sequences = input_sequences.squeeze(0)
+
+    B, S = input_sequences.shape
+    device = input_sequences.device
+
+    # 1) compute global variance
+    global_var = input_sequences.var(unbiased=False)
+    threshold = threshold_factor * global_var
+
+    # 2) build prefix sums for O(1) variance queries
+    x = input_sequences
+    cum_x = torch.cat([torch.zeros(B, 1, device=device), x.cumsum(dim=1)], dim=1)        # [B, S+1]
+    cum_x2 = torch.cat([torch.zeros(B, 1, device=device), (x * x).cumsum(dim=1)], dim=1) # [B, S+1]
+
+    mask = torch.zeros(B, S, dtype=torch.bool, device=device)
+    avg_sizes = torch.zeros(B, device=device)
+
+    # 3) iterate per batch (inner loop is now O(1) variance checks)
+    for b in range(B):
+        idx = 0
+        sizes = []
+        seq_cum_x = cum_x[b]
+        seq_cum_x2 = cum_x2[b]
+
+        while idx < S:
+            mask[b, idx] = True
+            start = idx
+            end = min(start + min_patch_size, S)
+
+            # grow until variance exceeds threshold or hit max size
+            while end < S:
+                length = end - start
+                sum_x  = seq_cum_x[end]  - seq_cum_x[start]
+                sum_x2 = seq_cum_x2[end] - seq_cum_x2[start]
+                var    = sum_x2 / length - (sum_x / length) ** 2
+
+                if var > threshold:
+                    break
+                if max_patch_size is not None and length >= max_patch_size:
+                    break
+                end += 1
+
+            size = end - start
+            sizes.append(size)
+            idx += size
+
+        avg_sizes[b] = float(sum(sizes)) / len(sizes)
+
+    return mask, avg_sizes
+
+
+
+def compute_random_patches(
+    batch_size: int,
+    seq_length: int,
+    min_patch_size: int = 4,
+    max_patch_size: int = 8,
+    seed: Optional[int] = None
+) -> torch.Tensor:
+    """
+    This version generates all patch sizes at once and uses cumsum to find positions.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    batch_patch_starts = torch.zeros(batch_size, seq_length, dtype=torch.bool)
+    
+    # Fixed patch size case
+    if min_patch_size == max_patch_size:
+        patch_size = min_patch_size
+        patch_indices = torch.arange(0, seq_length, patch_size)
+        batch_patch_starts[:, patch_indices] = 1
+        return batch_patch_starts
+    
+    # Variable patch size case - generate more patches than needed, then truncate
+    for batch_idx in range(batch_size):
+        # Estimate maximum number of patches needed
+        max_patches = seq_length // min_patch_size + 1
+        
+        # Generate random patch sizes
+        patch_sizes = torch.randint(min_patch_size, max_patch_size + 1, (max_patches,))
+        
+        # Use cumulative sum to get patch start positions
+        patch_positions = torch.cumsum(patch_sizes, dim=0) - patch_sizes[0]
+        
+        # Filter positions that are within sequence length
+        valid_positions = patch_positions[patch_positions < seq_length]
+        
+        # Set patch starts
+        if len(valid_positions) > 0:
+            batch_patch_starts[batch_idx, valid_positions] = 1
+    
+    return batch_patch_starts
+
 def compute_patches(
     entropies: List[List[float]],
     use_relative_entropies: bool = True,
     threshold: Optional[float] = None,
     min_patch_size: int = 4,
     max_patch_size: int = 8
-) -> Tuple[List[List[Tuple[int, int]]], List[float]]:
+) -> Tuple[List[torch.Tensor], List[float]]:
     """
     Compute variable-length patches based on entropy thresholds.
     
@@ -310,20 +435,23 @@ def compute_patches(
         max_patch_size: Maximum allowed patch size
     
     Returns:
-        Tuple of (batch_patches, thresholds_used):
-        - batch_patches: List of patch boundaries for each sequence 
-                        Each patch is (start_idx, end_idx) where end_idx is exclusive
+        Tuple of (batch_patch_starts, thresholds_used):
+        - batch_patch_starts: List of binary vectors for each sequence 
+                             Each vector is shape [seq_length], 1 at patch start, 0 elsewhere
         - thresholds_used: List of thresholds used for each sequence
-    
     """
-    batch_patches = []
+    batch_patch_starts = []
     thresholds_used = []
     
     for sequence_entropies in entropies:
         if len(sequence_entropies) == 0:
-            batch_patches.append([])
+            # Empty sequence - create single patch
+            batch_patch_starts.append(torch.tensor([1], dtype=torch.long))
             thresholds_used.append(0.0)
             continue
+        
+        seq_length = len(sequence_entropies)
+        patch_starts = torch.zeros(seq_length, dtype=torch.long)
         
         # Convert to numpy for easier computation
         entropy_array = np.array(sequence_entropies)
@@ -339,7 +467,6 @@ def compute_patches(
                     q25 = np.percentile(relevant_entropies, 25)
                     iqr = q75 - q25
                     # Use 75th percentile + 0.5 * IQR as threshold
-                    # This captures significant entropy increases while being robust to outliers
                     sequence_threshold = q75 + 0.5 * iqr
                     # Ensure minimum threshold to avoid too many patches
                     sequence_threshold = max(sequence_threshold, 0.2)
@@ -349,174 +476,117 @@ def compute_patches(
                 # For absolute entropies: Use mean + standard deviation
                 mean_entropy = np.mean(entropy_array)
                 std_entropy = np.std(entropy_array)
-                # Use mean + 1.0 * std as threshold
                 sequence_threshold = mean_entropy + 1.0 * std_entropy
-                # Ensure reasonable bounds
                 sequence_threshold = max(sequence_threshold, 1.0)
         else:
             sequence_threshold = threshold
         
         thresholds_used.append(sequence_threshold)
         
-        # Generate patches based on entropy threshold
-        patches = []
+        # Always start with first patch
+        patch_starts[0] = 1
         current_patch_start = 0
-        seq_length = len(sequence_entropies)
         
-        i = 0
+        i = 1
         while i < seq_length:
+            current_patch_size = i - current_patch_start
+            
             # Check if we should start a new patch due to high entropy
-            if (i > current_patch_start and 
-                sequence_entropies[i] > sequence_threshold and 
-                (i - current_patch_start) >= min_patch_size):
-                
-                # End current patch
-                patches.append((current_patch_start, i))
+            if (sequence_entropies[i] > sequence_threshold and 
+                current_patch_size >= min_patch_size):
+                patch_starts[i] = 1
                 current_patch_start = i
             
             # Force patch boundary if current patch reaches max size
-            elif (i - current_patch_start) >= max_patch_size:
-                patches.append((current_patch_start, i))
+            elif current_patch_size >= max_patch_size:
+                patch_starts[i] = 1
                 current_patch_start = i
             
             i += 1
         
-        # Add the final patch
-        if current_patch_start < seq_length:
-            final_patch_end = seq_length
-            final_patch_size = final_patch_end - current_patch_start
-            
-            # If final patch is too small, merge with previous patch
-            if final_patch_size < min_patch_size and len(patches) > 0:
-                # Remove last patch and extend it
-                last_start, _ = patches.pop()
-                patches.append((last_start, final_patch_end))
-            else:
-                patches.append((current_patch_start, final_patch_end))
-        
-        # Ensure we have at least one patch
-        if not patches:
-            patches.append((0, seq_length))
-        
-        # Validate patches
-        validated_patches = []
-        for start, end in patches:
-            patch_size = end - start
-            if patch_size >= min_patch_size:
-                validated_patches.append((start, end))
-            elif validated_patches:
-                # Merge small patch with previous one
-                prev_start, _ = validated_patches[-1]
-                validated_patches[-1] = (prev_start, end)
-            else:
-                # First patch, keep it even if small
-                validated_patches.append((start, end))
-        
-        batch_patches.append(validated_patches)
+        batch_patch_starts.append(patch_starts)
     
-    return batch_patches, thresholds_used
+    return batch_patch_starts, thresholds_used
+
 
 
 def compute_initial_patch_embeddings_with_pooling(
     input_embeddings: torch.Tensor,
-    batch_patches: Optional[List[List[Tuple[int, int]]]] = None,
-    hidden_size: int = None,
-    config = None,
-    pooling_type: str = "max"
+    batch_patch_starts: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+    hidden_size: Optional[int] = None,
+    config=None,
+    pooling_type: str = "max",
 ) -> torch.Tensor:
     """
     Compute patch embeddings using pooling over variable-length or fixed-size patches.
-    
-    This function supports two modes:
-    1. Variable-length patches: Uses provided batch_patches for adaptive patching
-    2. Fixed-size patches: Uses config.patch_size to create uniform patches
-    
-    Args:
-        input_embeddings: Input embeddings tensor of shape [batch_size, seq_length, hidden_size]
-        batch_patches: Optional list of patch boundaries for each sequence in the batch
-                      Each sequence contains patches as (start_idx, end_idx) tuples
-                      where end_idx is exclusive. If None, uses fixed patch size from config.
-        hidden_size: Hidden dimension size for output embeddings (inferred if None)
-        config: Model configuration containing patch_size for fixed patching mode
-        pooling_type: Type of pooling to use, either "max" or "avg" (default: "max")
-    
-    Returns:
-        torch.Tensor: Patch embeddings of shape [batch_size, num_patches, hidden_size]
-                     For variable patches: num_patches = max patches across sequences
-                     For fixed patches: num_patches = seq_length // patch_size
+    Fully vectorized and handles both Tensor and List[Tensor] inputs for batch_patch_starts.
     """
-    batch_size, seq_length, embed_dim = input_embeddings.shape
-    
-    # Infer hidden_size if not provided
-    if hidden_size is None:
-        hidden_size = embed_dim
-    
-    # Determine patching mode
-    if batch_patches is not None:
-        # Variable-length patches mode (adaptive)
-        max_num_patches = max(len(patches) for patches in batch_patches) if batch_patches else 1
-        
-        # Initialize output tensor with zeros
-        patch_embeddings = torch.zeros(
-            batch_size, max_num_patches, hidden_size,
-            dtype=input_embeddings.dtype,
-            device=input_embeddings.device
-        )
-        
-        for batch_idx, patches in enumerate(batch_patches):
-            for patch_idx, (start_idx, end_idx) in enumerate(patches):
-                # Ensure indices are within bounds
-                start_idx = max(0, min(start_idx, seq_length - 1))
-                end_idx = max(start_idx + 1, min(end_idx, seq_length))
-                
-                # Extract embeddings for this patch
-                patch_embeddings_slice = input_embeddings[batch_idx, start_idx:end_idx, :]  # [patch_length, hidden_size]
-                
-                # Apply pooling
-                if patch_embeddings_slice.size(0) > 0:
-                    if pooling_type == "max":
-                        patch_embedding = torch.max(patch_embeddings_slice, dim=0)[0]  # [hidden_size]
-                    else:  # avg pooling
-                        patch_embedding = torch.mean(patch_embeddings_slice, dim=0)  # [hidden_size]
-                    patch_embeddings[batch_idx, patch_idx, :] = patch_embedding
-    
-    else:
-        # Fixed-size patches mode
-        if config is None:
-            raise ValueError("Config must be provided when batch_patches is None for fixed-size patching")
-        
-        patch_size = getattr(config, 'patch_size', 1)
-        if patch_size <= 1:
-            # No patching, return original embeddings
-            return input_embeddings
-        
-        # Calculate number of patches
-        num_patches = seq_length // patch_size
-        
-        if num_patches == 0:
-            # Sequence too short, return zero tensor
-            patch_embeddings = torch.zeros(
-                batch_size, 1, hidden_size,
-                dtype=input_embeddings.dtype,
-                device=input_embeddings.device
-            )
+    B, S, D = input_embeddings.shape
+    hidden_size = hidden_size or D
+    device = input_embeddings.device
+    dtype = input_embeddings.dtype
+
+    if batch_patch_starts is not None:
+        # --- build a [B, S] boolean mask of patch-starts ---
+        if isinstance(batch_patch_starts, torch.Tensor):
+            batch_mask = batch_patch_starts.to(device).bool()          # [B, S]
         else:
-            # Truncate sequence to multiple of patch_size
-            truncated_seq_len = num_patches * patch_size
-            truncated_embeddings = input_embeddings[:, :truncated_seq_len, :]
-            
-            # Reshape to group into patches: [batch_size, num_patches, patch_size, hidden_size]
-            reshaped_embeddings = truncated_embeddings.view(
-                batch_size, num_patches, patch_size, hidden_size
+            batch_mask = torch.stack(batch_patch_starts, dim=0).to(device).bool()
+
+        # how many patches per sequence?
+        num_patches_per_seq = batch_mask.sum(dim=1)                    # [B]
+        P = int(num_patches_per_seq.max().item())                      # max patches
+
+        # assign each position a patch-id: cumsum(start_flags)-1
+        patch_ids = torch.cumsum(batch_mask.long(), dim=1) - 1        # [B, S]
+        # now values ∈ [0 .. num_patches_i-1]
+
+        # build one-hot over patches: [B, S, P]
+        patch_ids_exp = patch_ids.unsqueeze(-1)                       # [B, S, 1]
+        range_p = torch.arange(P, device=device).view(1, 1, P)        # [1, 1, P]
+        one_hot = (patch_ids_exp == range_p)                          # [B, S, P]
+
+        # expand embeddings to [B, S, P, D]
+        emb_exp = input_embeddings.unsqueeze(2).expand(-1, -1, P, -1)
+
+        if pooling_type == "max":
+            min_val = torch.finfo(dtype).min
+            masked = emb_exp.masked_fill(~one_hot.unsqueeze(-1), min_val)
+            # max over S → [B, P, D]
+            patch_embeddings = masked.max(dim=1)[0]
+            # zero out empty patches (where no start was present)
+            empty = one_hot.sum(dim=1) == 0                             # [B, P]
+            patch_embeddings = patch_embeddings.masked_fill(
+                empty.unsqueeze(-1), 0.0
             )
-            
-            # Apply pooling
-            if pooling_type == "max":
-                patch_embeddings = torch.max(reshaped_embeddings, dim=2)[0]  # [batch_size, num_patches, hidden_size]
-            else:  # avg pooling
-                patch_embeddings = torch.mean(reshaped_embeddings, dim=2)  # [batch_size, num_patches, hidden_size]
-    
-    return patch_embeddings
+        else:  # mean pooling
+            masked = emb_exp * one_hot.unsqueeze(-1).float()            # [B, S, P, D]
+            summed = masked.sum(dim=1)                                  # [B, P, D]
+            counts = one_hot.sum(dim=1).clamp(min=1).unsqueeze(-1)      # [B, P, 1]
+            patch_embeddings = summed / counts                          # [B, P, D]
+
+        return patch_embeddings
+
+    else:
+        # Fixed-size patches (unchanged)
+        if config is None:
+            raise ValueError("config must be provided when batch_patch_starts is None")
+        patch_size = getattr(config, "patch_size", 1)
+        if patch_size <= 1:
+            return input_embeddings
+
+        P = S // patch_size
+        if P == 0:
+            return torch.zeros(B, 1, hidden_size, device=device, dtype=dtype)
+
+        seq_trunc = P * patch_size
+        x = input_embeddings[:, :seq_trunc, :].view(B, P, patch_size, D)
+        if pooling_type == "max":
+            return x.max(dim=2)[0]
+        else:
+            return x.mean(dim=2)
+
+
 
 
 class TimeMoeInputEmbedding(nn.Module):
@@ -679,26 +749,18 @@ class TimeMoeLocalSelfAttention(nn.Module):
 
 
 class TimeMoeCrossAttention(nn.Module):
-    """
-    Unified cross-attention block similar to BLT's CrossAttention.
-    Can handle both directions:
-    - Encoder: Patch embeddings (queries) attend to point embeddings (keys/values)
-    - Decoder: Point embeddings (queries) attend to patch embeddings (keys/values)
-    """
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.dim = config.hidden_size
         self.head_dim = self.dim // config.num_patch_attention_heads
         self.n_heads = config.num_patch_attention_heads
-        self.n_kv_heads = config.num_patch_attention_heads # Same as n_heads for simplicity
+        self.n_kv_heads = config.num_patch_attention_heads
         self.heads_per_group = self.n_heads // self.n_kv_heads
         self.attention_dropout = getattr(config, 'attention_dropout', 0.0)
         
-        # Cross-attention layer norms (BLT pattern)
         self.cross_attn_norm_q = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
         self.cross_attn_norm_kv = TimeMoeRMSNorm(self.dim, eps=getattr(config, 'rms_norm_eps', 1e-6))
         
-        # Cross-attention projections
         self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -710,73 +772,60 @@ class TimeMoeCrossAttention(nn.Module):
         kv: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Unified cross-attention forward pass.
-        
-        Args:
-            x: query embeddings [batch_size, seq_len_q, dim] - Can be patches or points
-            kv: key/value embeddings [batch_size, seq_len_kv, dim] - Can be points or patches
-            mask: attention mask for controlling attention pattern
-                  Shape: [batch_size, seq_len_q, seq_len_kv] for per-sample masks
-                  OR [seq_len_q, seq_len_kv] for shared mask across batch
-        """
         bsz, seq_len_q, _ = x.shape
         _, seq_len_kv, _ = kv.shape
         
-        # Apply layer norms following BLT pattern
         x_norm = self.cross_attn_norm_q(x)
         kv_norm = self.cross_attn_norm_kv(kv)
         
-        # Cross-attention projections
-        xq = self.wq(x_norm)  # queries
-        xk = self.wk(kv_norm)  # keys
-        xv = self.wv(kv_norm)  # values
+        xq = self.wq(x_norm)
+        xk = self.wk(kv_norm)
+        xv = self.wv(kv_norm)
         
-        # Reshape for multi-head attention
         xq = xq.view(bsz, seq_len_q, self.n_heads, self.head_dim)
         xk = xk.view(bsz, seq_len_kv, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len_kv, self.n_kv_heads, self.head_dim)
         
-        # Repeat k,v heads if needed
         xk = repeat_kv(xk, self.heads_per_group)
         xv = repeat_kv(xv, self.heads_per_group)
         
-        # Transpose for attention computation
         xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
-        # Now: xq is [batch_size, n_heads, seq_len_q, head_dim]
-        # xk, xv are [batch_size, n_heads, seq_len_kv, head_dim]
         
-        # Compute attention scores
         attn_weights = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # Shape: [batch_size, n_heads, seq_len_q, seq_len_kv]
         
-        # Apply attention mask if provided
+        query_padding_mask = None
         if mask is not None:
             if mask.dim() == 2:
-                # Shared mask across batch: [seq_len_q, seq_len_kv]
-                # Broadcast to [batch_size, n_heads, seq_len_q, seq_len_kv]
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len_q, seq_len_kv]
+                mask = mask.unsqueeze(0).unsqueeze(0)
             elif mask.dim() == 3:
-                # Per-sample mask: [batch_size, seq_len_q, seq_len_kv]
-                # Broadcast to [batch_size, n_heads, seq_len_q, seq_len_kv]
-                mask = mask.unsqueeze(1)  # [batch_size, 1, seq_len_q, seq_len_kv]
-            else:
-                raise ValueError(f"Mask should be 2D or 3D, got {mask.dim()}D")
+                mask = mask.unsqueeze(1)
             
-            attn_weights = attn_weights + mask
+            # Find rows that are completely masked (padded queries)
+            fully_masked = (mask == float('-inf')).all(dim=-1)
+            query_padding_mask = fully_masked.any(dim=1)  # [batch_size, seq_len_q]
+            
+            # For fully masked rows, unmask the first position to prevent NaN
+            safe_mask = mask.clone()
+            safe_mask[fully_masked.unsqueeze(-1).expand_as(mask)] = 0.0
+            safe_mask = safe_mask.scatter(-1, torch.zeros_like(fully_masked.unsqueeze(-1), dtype=torch.long), 0.0)
+            
+            attn_weights = attn_weights + safe_mask
         
-        # Apply softmax
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=xv.dtype)
         attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         
-        # Apply attention to values
         output = torch.matmul(attn_weights, xv)
-        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        output = output.transpose(1, 2).contiguous()
         
-        # Output projection
         output = self.wo(output.view(bsz, seq_len_q, -1))
         
-        return x + output
+        output = x + output
+
+        # Post-processing cleanup: zero out padded query positions
+        if query_padding_mask is not None:
+            output = output.masked_fill(query_padding_mask.unsqueeze(-1), 0.0)
+
+        return output
     
     def create_cross_attention_mask(self, num_patches, patch_size, device, reverse=False):
         """
@@ -843,9 +892,11 @@ class TimeMoePatchify(nn.Module):
             TimeMoeCrossAttention(config) for _ in range(self.num_layers)
         ])
         
-        # Local self-attention layers for point embeddings (like BLT's LocalEncoder)
+        # Local self-attention layers for point embeddings
+        self.num_attention_layers = config.num_patchify_layers if config.use_unpatchify else config.num_patchify_layers - 1
+
         self.local_self_attention_layers = nn.ModuleList([
-            TimeMoeLocalSelfAttention(config) for _ in range(self.num_layers)# - 1)
+            TimeMoeLocalSelfAttention(config) for _ in range(self.num_attention_layers)
         ])
         
         # Layer norms for cross-attention
@@ -873,6 +924,9 @@ class TimeMoePatchify(nn.Module):
             residual = patch_embeddings
             patch_embeddings_norm = self.cross_attn_norms[layer_idx](patch_embeddings)
             
+            # print(patch_attention_masks.shape)
+            # breakpoint()
+
             cross_attn_output = self.cross_attention_layers[layer_idx](
                 x=patch_embeddings_norm,    # queries (patches)
                 kv=current_point_embeddings, # keys/values (points)
@@ -882,10 +936,13 @@ class TimeMoePatchify(nn.Module):
             
             # Local self-attention for point embeddings (like BLT's LocalEncoder)
             # This updates point embeddings using local context
-            if layer_idx < self.num_layers: # - 1:  # No local self-attention on last layer
+            if layer_idx < self.num_attention_layers:
                 current_point_embeddings = self.local_self_attention_layers[layer_idx](
                     current_point_embeddings
                 )
+
+            # if patch_attention_masks.shape[-1] != 1024:
+            #     breakpoint()
         
         return patch_embeddings, current_point_embeddings
 
@@ -1053,33 +1110,6 @@ class TimeMoeLinearUnpatchify(nn.Module):
         point_embeddings = self.layer_norm(point_embeddings)
         
         return point_embeddings
-
-
-class TimeMoeTransformerUnpatchify(nn.Module):
-    """
-    Transformer-based unpatchify module using TimeMoeUnpatchify.
-    Similar to BLT's LocalDecoder approach.
-    """
-    
-    def __init__(self, config: TimeMoeConfig):
-        super().__init__()
-        self.config = config
-        self.patch_size = config.patch_size
-        
-        # Use the new unpatchify module
-        self.unpatchify = TimeMoeUnpatchify(config)
-        
-    def forward(self, patch_embeddings, encoder_point_embeddings, original_seq_len=None):
-        """
-        Args:
-            patch_embeddings: [batch_size, num_patches, hidden_size] - Input patch embeddings from main model
-            encoder_point_embeddings: [batch_size, seq_len, hidden_size] - Point embeddings from encoder
-            original_seq_len: Optional original sequence length for reshaping
-        
-        Returns:
-            point_embeddings: [batch_size, seq_len, hidden_size] - Refined point embeddings
-        """
-        return self.unpatchify(patch_embeddings, encoder_point_embeddings, original_seq_len)
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -1668,14 +1698,14 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         else:
             self.embed_layer = None
 
-        if self.config.patching_strategy == "adaptive":
+        # if self.config.patching_strategy == "adaptive":
 
-            # Use Chronos for computing entropy
-            self.chronos_pipeline = BaseChronosPipeline.from_pretrained(
-                "../model_weights/chronos/chronos-t5-small",
-                device_map="cuda:0",#self.device,
-                torch_dtype=torch.bfloat16,
-            )
+        #     # Use Chronos for computing entropy
+        #     self.chronos_pipeline = BaseChronosPipeline.from_pretrained(
+        #         "../model_weights/chronos/chronos-t5-small",
+        #         device_map="cuda:0",#self.device,
+        #         torch_dtype=torch.bfloat16,
+        #     )
 
         if self.patch_size > 1:
             # Choose patch embedding type based on configuration
@@ -1691,7 +1721,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 self.unpatchify = TimeMoeLinearUnpatchify(config)
             else:
                 # Add transformer-based unpatchify for sophisticated reconstruction
-                self.unpatchify = TimeMoeTransformerUnpatchify(config)
+                self.unpatchify = TimeMoeUnpatchify(config)
         else:
             self.unpatchify = None
 
@@ -1769,31 +1799,44 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if self.config.patch_embedding_type == 'transformer':
             if self.config.patching_strategy == "adaptive":
 
-                # Get predictions with logits for entropy computation
-                batch_predictions, batch_entropies, batch_relative_entropies, batch_logits = compute_entropies(
-                    input_ids, self.chronos_pipeline, self.config
-                )
+                # # Get predictions with logits for entropy computation
+                # batch_predictions, batch_entropies, batch_relative_entropies, batch_logits = compute_entropies(
+                #     input_ids, self.chronos_pipeline, self.config
+                # )
 
-                # Compute patches based on entropies
-                batch_patches, thresholds = compute_patches(
-                    batch_relative_entropies, 
-                    use_relative_entropies=True,
-                    min_patch_size=4,
-                    max_patch_size=8
-                )
+                # # Compute patches based on entropies
+                # batch_patches, thresholds = compute_patches(
+                #     batch_relative_entropies, 
+                #     use_relative_entropies=True,
+                #     min_patch_size=4,
+                #     max_patch_size=8
+                # )
+
+                # batch_patch_starts = compute_random_patches(
+                #     batch_size=batch_size,
+                #     seq_length=seq_length,
+                #     min_patch_size=4,
+                #     max_patch_size=8,
+                #     seed=42  # For reproducible results during testing
+                # )
+                batch_patch_starts, avg_patch_size = compute_threshold_patches(input_ids, threshold_factor=0.01, min_patch_size=2, max_patch_size=8)
 
                 # Compute patch embeddings using max pooling over variable-length patches
                 initial_patch_embeds = compute_initial_patch_embeddings_with_pooling(
-                    inputs_embeds, batch_patches, self.config.hidden_size, self.config
+                    inputs_embeds, batch_patch_starts, self.config.hidden_size, self.config
                 )
-                
+
                 # Create attention masks for variable-length patches
                 patch_attention_masks = compute_patch_attention_masks(
-                    batch_patches=batch_patches,
+                    batch_patch_starts=batch_patch_starts,
                     device=inputs_embeds.device,
                     dtype=inputs_embeds.dtype
                 )
 
+                # Store batch patches for loss computation
+                self._batch_patches = batch_patch_starts
+                # print(patch_attention_masks.shape)
+                # breakpoint()
             else:
                 # compute maxpooled patches with fixed patch size
                 initial_patch_embeds = compute_initial_patch_embeddings_with_pooling(
@@ -1809,6 +1852,9 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                     device=inputs_embeds.device,
                     dtype=inputs_embeds.dtype
                 )
+
+                # Store batch patches for loss computation
+                self._batch_patches = None
 
         # Store original sequence length for attention mask computation
         original_seq_length = seq_length
@@ -1922,22 +1968,11 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             original_seq_len = getattr(self, '_original_seq_length', patch_seq_len * self.patch_size)
             
             # Apply appropriate unpatchify based on patch embedding type
-            if getattr(self.config, 'patch_embedding_type', 'transformer') == 'linear':
-                # Linear unpatchify: only needs patch embeddings
-                hidden_states = self.unpatchify(hidden_states, original_seq_len)
+            if self.config.patch_embedding_type == 'linear':
+                hidden_states = self.unpatchify(hidden_states, patch_seq_len * self.patch_size)
             else:
-                # Transformer unpatchify: needs both patch embeddings and encoder point embeddings
-                encoder_point_embeddings = getattr(self, '_encoder_point_embeddings', None)
-                if encoder_point_embeddings is not None:
-                    hidden_states = self.unpatchify(hidden_states, encoder_point_embeddings, original_seq_len)
-                else:
-                    # Fallback: create dummy point embeddings if not available
-                    batch_size, num_patches, hidden_size = hidden_states.shape
-                    dummy_point_embeddings = torch.zeros(
-                        batch_size, num_patches, self.patch_size, hidden_size,
-                        device=hidden_states.device, dtype=hidden_states.dtype
-                    )
-                    hidden_states = self.unpatchify(hidden_states, dummy_point_embeddings, original_seq_len)
+                # transpose of encoder patch_attention_masks
+                hidden_states = self.unpatchify(hidden_states, self._encoder_point_embeddings, patch_attention_masks.transpose(1, 2))
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -2063,9 +2098,10 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         if labels is not None:
             # AutoRegressive loss
             ar_loss = 0.0
+
             for lm_head, horizon_length in zip(self.lm_heads, self.config.horizon_lengths):
                 one_predictions = lm_head(hidden_states)
-                one_loss = self.calc_ar_loss(one_predictions, labels, loss_masks, horizon_length)
+                one_loss = self.calc_ar_loss(one_predictions, labels, loss_masks, horizon_length, patch_starts=self.model._batch_patches)
                 ar_loss += one_loss
                 if predictions is None:
                     predictions = one_predictions
@@ -2110,14 +2146,12 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             attentions=outputs.attentions,
         )
 
-    def calc_ar_loss(self, predictions, labels, loss_masks, horizon_length):
+    def calc_ar_loss(self, predictions, labels, loss_masks, horizon_length, patch_starts=None):
         if len(labels.shape) == 2:
             labels.unsqueeze_(dim=-1)
-            # enable model parallelism
             labels = labels.to(predictions.device)
         if loss_masks is not None and len(loss_masks.shape) == 2:
             loss_masks.unsqueeze_(dim=-1)
-            # enable model parallelism
             loss_masks = loss_masks.to(predictions.device)
 
         # Get patch size from config
@@ -2128,17 +2162,12 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             shift_predictions = predictions.view(batch_size, seq_len, horizon_length, -1)
 
             # pad to the same length with predictions
-            # shape -> [B, input_size, seq_len + horizon_length -1]
             labels = F.pad(labels.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
-
-            # shape -> [B, input_size, seq_len, horizon_length]
             shift_labels = labels.unfold(dimension=-1, size=horizon_length, step=1)
             shift_labels = shift_labels.permute(0, 2, 3, 1)
 
             if loss_masks is not None:
-                # pad to the same length with predictions
                 loss_masks = F.pad(loss_masks.transpose(-1, -2), (0, horizon_length - 1), mode='constant', value=0)
-
                 loss_masks = loss_masks.unfold(dimension=-1, size=horizon_length, step=1)
                 loss_masks = loss_masks.permute(0, 2, 3, 1)
 
@@ -2148,13 +2177,48 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
 
         # If patch_size > 1, we need to sample labels at patch boundaries
         # Skip this sampling if unpatchify is enabled, as the model outputs point-level predictions
-        if patch_size > 1 and not getattr(self.config, 'use_unpatchify', False):
-            seq_len = predictions.shape[1]
-            max_start_pos = seq_len * patch_size - 1 
-            patch_starts = torch.arange(0, max_start_pos + 1, patch_size, device=labels.device)
-            shift_labels = shift_labels[:, patch_starts, :]
-            loss_masks = loss_masks[:, patch_starts, :] if loss_masks is not None else None
+        if patch_size > 1 and self.config.use_unpatchify == False:
+            if patch_starts is not None:
+                # Adaptive patching: patch_starts is a list of binary vectors
+                max_patches = max([starts.sum().item() for starts in patch_starts])
+                padded_labels = []
+                padded_masks = []
                 
+                for i in range(shift_labels.shape[0]):
+                    # Get patch boundaries from binary vector
+                    patch_indices = torch.nonzero(patch_starts[i], as_tuple=False).flatten()
+                    sampled_labels = shift_labels[i, patch_indices, :]  # [num_patches_i, ...]
+                    
+                    # Pad to max_patches
+                    pad_len = max_patches - sampled_labels.shape[0]
+                    if pad_len > 0:
+                        pad = torch.zeros(pad_len, *sampled_labels.shape[1:], 
+                                        device=sampled_labels.device, dtype=sampled_labels.dtype)
+                        sampled_labels = torch.cat([sampled_labels, pad], dim=0)
+                    padded_labels.append(sampled_labels)
+                    
+                    if loss_masks is not None:
+                        sampled_masks = loss_masks[i, patch_indices, :]
+                        if pad_len > 0:
+                            pad_mask = torch.zeros(pad_len, *sampled_masks.shape[1:], 
+                                                device=sampled_masks.device, dtype=sampled_masks.dtype)
+                            sampled_masks = torch.cat([sampled_masks, pad_mask], dim=0)
+                        padded_masks.append(sampled_masks)
+                
+                shift_labels = torch.stack(padded_labels, dim=0)
+                if loss_masks is not None:
+                    loss_masks = torch.stack(padded_masks, dim=0)
+                
+                # Pad predictions to max_patches
+                shift_predictions = shift_predictions[:, :max_patches, :]
+            else:
+                # Fixed patching: sample at regular intervals
+                seq_len = predictions.shape[1]
+                max_start_pos = seq_len * patch_size - 1 
+                patch_starts_indices = torch.arange(0, max_start_pos + 1, patch_size, device=labels.device)
+                shift_labels = shift_labels[:, patch_starts_indices, :]
+                loss_masks = loss_masks[:, patch_starts_indices, :] if loss_masks is not None else None
+
         # Calculate loss with mask
         losses = self.loss_function(shift_predictions, shift_labels)
 
@@ -2165,6 +2229,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             loss = torch.mean(losses)
 
         return loss
+
 
     def prepare_inputs_for_generation(
             self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
@@ -2244,9 +2309,6 @@ class TimeMoeUnpatchify(nn.Module):
     
     This module converts patch embeddings back to point embeddings through:
     1. Cross-attention where points (queries) attend to patches (keys/values)
-    
-    Following BLT's LocalDecoder design, this only uses cross-attention
-    without self-attention or feedforward networks.
     """
     
     def __init__(self, config: TimeMoeConfig):
@@ -2256,7 +2318,7 @@ class TimeMoeUnpatchify(nn.Module):
         self.patch_size = config.patch_size
         self.num_layers = config.num_unpatchify_layers
 
-        # Only cross-attention layers (like BLT's LocalDecoder)
+        # Cross-attention layers
         self.cross_attention_layers = nn.ModuleList([
             TimeMoeCrossAttention(config) for _ in range(self.num_layers)
         ])
@@ -2266,47 +2328,35 @@ class TimeMoeUnpatchify(nn.Module):
             TimeMoeLocalSelfAttention(config) for _ in range(self.num_layers)
         ])
         
-        # Layer norms for cross-attention only
+        # Layer norms for cross-attention
         self.cross_attn_norms = nn.ModuleList([
             TimeMoeRMSNorm(self.hidden_size, config.rms_norm_eps)
             for _ in range(self.num_layers)
         ])
-    
-    def forward(self, patch_embeddings, encoder_point_embeddings, original_seq_len=None):
+
+    def forward(self, patch_embeddings, encoder_point_embeddings, cross_attention_mask=None):
         """
         Args:
             patch_embeddings: [batch_size, num_patches, hidden_size] - Input patch embeddings from main model
             encoder_point_embeddings: [batch_size, seq_len, hidden_size] - Point embeddings from encoder
-            original_seq_len: Optional original sequence length for reshaping
+            batch_patch_starts: Optional list of binary vectors for adaptive patching
         
         Returns:
             point_embeddings: [batch_size, seq_len, hidden_size] - Refined point embeddings
         """
-        batch_size, num_patches, hidden_size = patch_embeddings.shape
-        
+
         # Use encoder point embeddings as starting point
         point_embeddings = encoder_point_embeddings
         
         for layer_idx in range(self.num_layers):
-            # Cross-attention: points attend to patches (like BLT's LocalDecoder)
+            # Cross-attention: points attend to patches
             residual = point_embeddings
             point_embeddings_norm = self.cross_attn_norms[layer_idx](point_embeddings)
-            
-            # Create reverse cross-attention mask
-            seq_len = point_embeddings.shape[1]
-            patch_size = seq_len // num_patches
-            
-            # Create mask where each point can attend to its corresponding patch
-            cross_mask = self._create_reverse_cross_mask(
-                num_patches=num_patches,
-                patch_size=patch_size,
-                device=point_embeddings.device
-            )
             
             cross_attn_output = self.cross_attention_layers[layer_idx](
                 x=point_embeddings_norm,  # queries (points)
                 kv=patch_embeddings,      # keys/values (patches)
-                mask=cross_mask
+                mask=cross_attention_mask
             )
             point_embeddings = residual + cross_attn_output
 
@@ -2316,120 +2366,67 @@ class TimeMoeUnpatchify(nn.Module):
             )
 
         return point_embeddings
-    
-    def _create_reverse_cross_mask(self, num_patches, patch_size, device):
-        """Create mask for reverse cross-attention where points attend to patches."""
-        seq_len = num_patches * patch_size
-        
-        # Create mask: [seq_len, num_patches]
-        mask = torch.full((seq_len, num_patches), float('-inf'), device=device)
-        
-        for patch_idx in range(num_patches):
-            start_idx = patch_idx * patch_size
-            end_idx = (patch_idx + 1) * patch_size
-            # Points in this patch can attend to this patch
-            mask[start_idx:end_idx, patch_idx] = 0.0
-        
-        return mask.unsqueeze(0)  # Add batch dimension
 
 
 def compute_patch_attention_masks(
-    batch_patches: Optional[List[List[Tuple[int, int]]]] = None,
-    batch_size: int = None,
-    seq_length: int = None,
-    patch_size: int = None,
+    batch_patch_starts: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+    batch_size: Optional[int] = None,
+    seq_length: Optional[int] = None,
+    patch_size: Optional[int] = None,
     device: torch.device = None,
-    dtype: torch.dtype = None
+    dtype: torch.dtype = None,
 ) -> torch.Tensor:
     """
     Create attention masks for cross-attention between patch embeddings and point embeddings.
+    Fully vectorized, no Python loops.
     
-    This function creates masks that ensure each patch embedding only attends to point embeddings
-    within its corresponding patch boundaries. Supports both variable-length patches (adaptive)
-    and fixed-size patches.
-    
-    Args:
-        batch_patches: Optional list of patch boundaries for each sequence in the batch
-                      Each sequence contains patches as (start_idx, end_idx) tuples
-                      If None, uses fixed patch size
-        batch_size: Batch size for fixed patching mode
-        seq_length: Sequence length for fixed patching mode  
-        patch_size: Fixed patch size for uniform patching mode
-        device: Device to create tensors on
-    
-    Returns:
-        torch.Tensor: Attention mask of shape [batch_size, max_num_patches, padded_seq_length]
-                     where 0.0 means attend and -inf means mask out
-    
-    Example usage:
-        ```python
-        # For adaptive patches
-        patch_masks = compute_patch_attention_masks(
-            batch_patches=batch_patches,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype
-        )
-        
-        # For fixed patches
-        patch_masks = compute_patch_attention_masks(
-            batch_patches=None,
-            batch_size=batch_size,
-            seq_length=seq_length,
-            patch_size=patch_size,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype
-        )
-        ```
+    Returns a tensor of shape [B, P, L] with 0.0 where attend is allowed and -inf elsewhere.
     """
-    
-    if batch_patches is not None:
-        # Variable-length patches mode (adaptive)
-        max_num_patches = max(len(patches) for patches in batch_patches) if batch_patches else 1
-        max_seq_length = max(
-            max(end for start, end in patches) if patches else 0 
-            for patches in batch_patches
-        )
-        batch_size = len(batch_patches)
-        
-        # Initialize attention mask with large negative values instead of -inf for better gradients
-        attention_mask = torch.full(
-            (batch_size, max_num_patches, max_seq_length),
-            -1e4,  # Use -1e4 instead of -inf for better gradient flow
-            device=device,
-            dtype=dtype or torch.float32
-        )
-        
-        # Fill in 0.0 for valid patch-point correspondences
-        for batch_idx, patches in enumerate(batch_patches):
-            for patch_idx, (start_idx, end_idx) in enumerate(patches):
-                # Each patch can only attend to points within its boundaries
-                attention_mask[batch_idx, patch_idx, start_idx:end_idx] = 0.0
-                
+    dtype = dtype or torch.float32
+    if batch_patch_starts is not None:
+        # --- Adaptive (variable-length) ---
+        # Accept either a [B, L] tensor or a list of [L] tensors
+        if isinstance(batch_patch_starts, torch.Tensor):
+            start_mask = batch_patch_starts.to(device).bool()  # [B, L]
+        else:
+            start_mask = torch.stack(batch_patch_starts, dim=0).to(device).bool()  # [B, L]
+
+        B, L = start_mask.shape
+        # compute patch IDs: cumsum start flags minus 1 → values in [-1..], clamp to [0..P-1]
+        raw_ids = torch.cumsum(start_mask.long(), dim=1) - 1  # [B, L]
+        P = int(start_mask.sum(dim=1).max().item())
+        patch_ids = raw_ids.clamp(min=0, max=P - 1)         # [B, L]
+
+        # build a [B, P, L] boolean mask: True where patch_ids == p
+        patch_ids_exp = patch_ids.unsqueeze(1)               # [B, 1, L]
+        range_p = torch.arange(P, device=device).view(1, P, 1)  # [1, P, 1]
+        valid = (patch_ids_exp == range_p)                   # [B, P, L]
+
+        # create final attention mask
+        attn_mask = torch.full((B, P, L), float('-inf'),
+                               device=device, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(valid, 0.0)
+        return attn_mask
+
     else:
-        # Fixed-size patches mode
+        # --- Fixed-size patches ---
         if batch_size is None or seq_length is None or patch_size is None:
-            raise ValueError("For fixed patching, batch_size, seq_length, and patch_size must be provided")
-        
-        num_patches = seq_length // patch_size
-        if num_patches == 0:
-            num_patches = 1
-        
-        # Truncate sequence to multiple of patch_size
-        truncated_seq_len = num_patches * patch_size
-        
-        # Initialize attention mask with large negative values instead of -inf for better gradients
-        attention_mask = torch.full(
-            (batch_size, num_patches, truncated_seq_len),
-            -1e4,  # Use -1e4 instead of -inf for better gradient flow
-            device=device,
-            dtype=dtype or torch.float32
-        )
-        
-        # Fill in 0.0 for fixed patch boundaries
-        for patch_idx in range(num_patches):
-            start_idx = patch_idx * patch_size
-            end_idx = (patch_idx + 1) * patch_size
-            # Each patch attends only to its own points
-            attention_mask[:, patch_idx, start_idx:end_idx] = 0.0
-    
-    return attention_mask
+            raise ValueError("For fixed patches, must provide batch_size, seq_length, and patch_size")
+        B = batch_size
+        # how many patches?
+        P = seq_length // patch_size
+        if P == 0:
+            P = 1
+        L = P * patch_size
+
+        # build [P, L] mask once
+        patch_idx = torch.arange(P, device=device).view(P, 1)      # [P, 1]
+        point_idx = torch.arange(L, device=device).view(1, L)      # [1, L]
+        valid = (point_idx >= patch_idx * patch_size) & \
+                (point_idx < (patch_idx + 1) * patch_size)         # [P, L]
+
+        # expand to [B, P, L]
+        attn_mask = torch.full((B, P, L), float('-inf'),
+                               device=device, dtype=dtype)
+        attn_mask = attn_mask.masked_fill(valid.unsqueeze(0), 0.0)
+        return attn_mask

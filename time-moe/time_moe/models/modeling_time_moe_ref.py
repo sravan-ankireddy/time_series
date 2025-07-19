@@ -253,14 +253,12 @@ class TimeMoeTemporalBlock(nn.Module):
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
-
 class TimeMoeMLP(TimeMoeTemporalBlock):
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
         super().__init__(hidden_size, intermediate_size, hidden_act)
 
     def forward(self, hidden_state):
         return super().forward(hidden_state), None
-
 
 class TimeMoeSparseExpertsLayer(nn.Module):
     def __init__(self, config):
@@ -334,7 +332,6 @@ class TimeMoeSparseExpertsLayer(nn.Module):
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
-
 
 # Copied from transformers.models.qwen2.modeling_qwen2.Qwen2Attention with Qwen2->TimeMoe
 class TimeMoeAttention(nn.Module):
@@ -459,7 +456,6 @@ class TimeMoeAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
 
 class TimeMoeFlashAttention2(TimeMoeAttention):
 
@@ -649,12 +645,10 @@ class TimeMoeFlashAttention2(TimeMoeAttention):
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
 
-
 TIME_MOE_ATTENTION_CLASSES = {
     "eager": TimeMoeAttention,
     'flash_attention_2': TimeMoeFlashAttention2,
 }
-
 
 class TimeMoeDecoderLayer(nn.Module):
     def __init__(self, config: TimeMoeConfig, layer_idx: int):
@@ -753,7 +747,6 @@ class TimeMoePreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-
 
 class TimeMoeModel(TimeMoePreTrainedModel):
     """

@@ -1136,16 +1136,23 @@ class TimeMoeModel(TimeMoePreTrainedModel):
     def __init__(self, config: TimeMoeConfig):
         super().__init__(config)
         # self.embed_layer = TimeMoeInputEmbedding(config)
+        self.config = config
 
-        self.encoder = MambaEncoder()
-        self.downsample = Downsampling(1024,256)
+        if config.patch_embedding_type == "linear":
+            if config.patch_size == 1:
+                self.encoder = TimeMoeInputEmbedding(config)
+            else:
+                self.encoder = LinearEncoder(config)
+                self.decoder = LinearDecoder(config)
+        elif config.patch_embedding_type == "mamba":
+            self.encoder = MambaEncoder()
+            self.downsample = Downsampling(1024,256)
 
+            self.decoder = MambaDecoder()
+            self.upsample = Upsampling(256, 1024)
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-
-        self.decoder = MambaDecoder()
-        self.upsample = Upsampling(256, 1024)
 
         self._attn_implementation = config._attn_implementation
         self.norm = TimeMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1204,7 +1211,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
         if inputs_embeds is None:
             encoder_embeddings = self.encoder(input_ids)
-            inputs_embeds = self.downsample(encoder_embeddings)
+            if hasattr(self, 'downsample'):
+                inputs_embeds = self.downsample(encoder_embeddings)
         batch_size, seq_length, _ = inputs_embeds.shape
     
         if position_ids is None:
@@ -1280,8 +1288,10 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         # project back to the input space
-        hidden_states = self.upsample(hidden_states)
-        hidden_states = self.decoder(hidden_states, encoder_embeddings)
+        if hasattr(self, 'upsample'):
+            hidden_states = self.upsample(hidden_states)
+        if hasattr(self, 'decoder'):
+            hidden_states = self.decoder(hidden_states, encoder_embeddings)
     
         next_cache = None
         if use_cache:

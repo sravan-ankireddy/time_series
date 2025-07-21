@@ -333,44 +333,22 @@ class TimeMoeRunner:
             stride=train_config["stride"],
             normalization_method=train_config["normalization_method"],
         )
+        # breakpoint()
+        # # train a 1000 samples from train_ds at .pt file
+        # from torch.utils.data import Subset
+        # sample_ds = Subset(train_ds, list(range(1000)))
+        # torch.save(sample_ds, "../datasets/time-300b-sample.pt")
+        # breakpoint()
+
+        # load the sample dataset
+        # train_ds = torch.load("../datasets/time-300b-sample.pt",weights_only=False)
+        # print(f'Loaded {len(train_ds)} samples from the sample dataset')
+
         trainer = TimeMoeTrainer(
             model=model,
             args=training_args,
             train_dataset=train_ds,
         )
-
-        # class MemoryCleanupTrainer(TimeMoeTrainer):
-        #     def __init__(self, *args, **kwargs):
-        #         super().__init__(*args, **kwargs)
-        #         self.cleanup_counter = 0
-                
-        #     def training_step(self, model, inputs):
-        #         result = super().training_step(model, inputs)
-        #         self.cleanup_counter += 1
-                
-        #         # Cleanup and memory logging every 1000 steps
-        #         if self.cleanup_counter % 1000 == 0:
-
-        #             log_in_local_rank_0(f"Memory cleanup at step {self.state.global_step}...")
-        #             mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        #             log_in_local_rank_0(f"Before cleanup: CPU Memory: {mem_mb:.2f} MB")
-
-        #             gc.collect()
-        #             if torch.cuda.is_available():
-        #                 torch.cuda.empty_cache()
-        #                 torch.cuda.ipc_collect()
-                        
-        #             # Log memory usage
-        #             mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        #             log_in_local_rank_0(f"After cleanup: CPU Memory: {mem_mb:.2f} MB")
-                    
-        #         return result
-
-        # trainer = MemoryCleanupTrainer(
-        #     model=model,
-        #     args=training_args,
-        #     train_dataset=train_ds,
-        # )
         
         # Resume from checkpoint if not training from scratch
         if not from_scratch and model_path is not None:

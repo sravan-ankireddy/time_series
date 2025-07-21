@@ -12,6 +12,11 @@ from transformers.modeling_outputs import MoeModelOutputWithPast, MoeCausalLMOut
 from transformers.utils import logging, is_flash_attn_2_available, is_flash_attn_greater_or_equal_2_10
 
 from mamba_ssm import Mamba2
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+from dataclasses import dataclass
+from einops import repeat, rearrange
+import torch.nn.init as init
 
 from .configuration_time_moe import TimeMoeConfig
 from .ts_generation_mixin import TSGenerationMixin
@@ -26,6 +31,19 @@ try:
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 except:
     pass
+
+class STE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return torch.ones_like(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_x = grad_output
+        return grad_x
+
+def ste_func(x):
+    return STE.apply(x)
 
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -194,37 +212,33 @@ class Downsampling(nn.Module):
     """
     def __init__(
         self,
-        input_length: int,
-        output_length: int,
+        sampling_factor: int,
         pooling_type: Literal["max", "min", "avg", "boundary"] = "max"
     ):
         super().__init__()
-        self.input_length = input_length
-        self.output_length = output_length
+        self.sampling_factor = sampling_factor
         self.pooling_type = pooling_type
-        
         # Check if downsampling is needed
-        self.needs_downsampling = output_length != input_length
-        if self.needs_downsampling:
-            assert input_length % output_length == 0, f"input_length ({input_length}) must be divisible by output_length ({output_length})"
-            self.downsample_ratio = input_length // output_length
-    
+        self.needs_downsampling = sampling_factor > 1
+        
     def forward(self, x):
         """
         Args:
             x: Input tensor of shape (batch_size, input_length, dim)
         Returns:
             Output tensor of shape (batch_size, output_length, dim)
+            where output_length = input_length // sampling_factor
         """
         if not self.needs_downsampling:
             return x
+            
+        batch_size, input_length, dim = x.shape
+        output_length = input_length // self.sampling_factor
         
-        batch_size, seq_len, dim = x.shape
         output = []
-        
-        for i in range(self.output_length):
+        for i in range(output_length):
             # Define causal window: from start to current boundary
-            end_pos = min((i + 1) * self.downsample_ratio, self.input_length)
+            end_pos = min((i + 1) * self.sampling_factor, input_length)
             # Extract causal window
             window = x[:, :end_pos, :]  # (batch_size, window_length, dim)
             
@@ -240,9 +254,9 @@ class Downsampling(nn.Module):
                 pooled = window[:, -1, :]  # (batch_size, dim)
             else:
                 raise ValueError(f"Unknown pooling type: {self.pooling_type}")
-            
+                
             output.append(pooled)
-        
+            
         # Stack outputs
         output = torch.stack(output, dim=1)  # (batch_size, output_length, dim)
         return output
@@ -254,32 +268,27 @@ class Upsampling(nn.Module):
     """
     def __init__(
         self,
-        input_length: int,
-        output_length: int
+        sampling_factor: int
     ):
         super().__init__()
-        self.input_length = input_length
-        self.output_length = output_length
-        
+        self.sampling_factor = sampling_factor
         # Check if upsampling is needed
-        self.needs_upsampling = output_length != input_length
-        if self.needs_upsampling:
-            assert output_length % input_length == 0, f"output_length ({output_length}) must be divisible by input_length ({input_length})"
-            self.upsample_ratio = output_length // input_length
-    
+        self.needs_upsampling = sampling_factor > 1
+        
     def forward(self, x):
         """
         Args:
             x: Input tensor of shape (batch_size, input_length, dim)
         Returns:
             Output tensor of shape (batch_size, output_length, dim)
+            where output_length = input_length * sampling_factor
         """
         if not self.needs_upsampling:
             return x
-        
-        # Repeat each embedding by the upsample ratio
-        # (a,b,c) becomes (a,a,a,a,b,b,b,b,c,c,c,c) for ratio=4
-        upsampled = x.repeat_interleave(self.upsample_ratio, dim=1)
+            
+        # Repeat each embedding by the sampling factor
+        # (a,b,c) becomes (a,a,a,a,b,b,b,b,c,c,c,c) for sampling_factor=4
+        upsampled = x.repeat_interleave(self.sampling_factor, dim=1)
         return upsampled
 
 
@@ -378,7 +387,7 @@ class LinearEncoder(nn.Module):
 
 class LinearDecoder(nn.Module):
     """
-    Unpatchify module that projects patch embeddings back to point embeddings.
+    Decoder module that projects patch embeddings back to point embeddings.
     
     This module reverses the patching operation by expanding each patch embedding
     into multiple point embeddings, enabling fine-grained temporal predictions.
@@ -448,111 +457,330 @@ class LinearDecoder(nn.Module):
 
 class MambaEncoder(nn.Module):
     """
-    Pure Mamba encoder without downsampling logic.
+    Mamba2-based encoder for Time-MoE models.
     """
-    def __init__(
-        self,
-        input_dim: int = 1,
-        d_model: int = 384,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        n_layers: int = 2,
-    ):
+    def __init__(self, config: TimeMoeConfig):
         super().__init__()
-        self.input_dim = input_dim
-        self.d_model = d_model
-        self.n_layers = n_layers
-        
-        # Input embedding - project from input_dim to d_model
-        self.input_embedding = nn.Linear(input_dim, d_model)
-        
-        # Multiple Mamba2 layers with layer normalization
+        self.config = config
+
+        # Input embedding: project from input_dim to d_model
+        self.input_embedding = nn.Linear(config.input_size, config.hidden_size)
+
+        # Build Mamba2 layers + RMS‐norms
         self.mamba_layers = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
-        
-        for _ in range(n_layers):
-            self.mamba_layers.append(Mamba2(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            ))
-            self.layer_norms.append(TimeMoeRMSNorm(d_model, eps=1e-6))
+        self.layer_norms  = nn.ModuleList()
 
-        self.final_layer_norm = TimeMoeRMSNorm(d_model, eps=1e-6)
+        for _ in range(config.num_encoder_layers):
+            self.mamba_layers.append(
+                Mamba2(
+                    d_model=config.hidden_size,
+                    d_state=config.d_state,
+                    d_conv=config.d_conv,
+                    expand=config.expand,
+                )
+            )
+            self.layer_norms.append(
+                TimeMoeRMSNorm(config.hidden_size, eps=1e-6)
+            )
 
-    def forward(self, x):
+        # Final layer norm
+        self.final_layer_norm = TimeMoeRMSNorm(config.hidden_size, eps=1e-6)
+
+        # Re‑init all Conv1d and Linear weights to a sane uniform range
+        self._init_conv1d()
+
+    def _init_conv1d(self):
+        """
+        FIX ME: Reinitialize only Conv1d layers inside Mamba layers with normal initialization
+        """
+        for mamba_layer in self.mamba_layers:
+            for module in mamba_layer.modules():
+                if isinstance(module, nn.Conv1d):
+                    with torch.no_grad():
+                        fan_in = module.weight.size(1) * module.weight.size(2)  # in_channels * kernel_size
+                        std = (2.0 / fan_in) ** 0.5  # Kaiming std for ReLU/SiLU
+                        new_weights = torch.randn_like(module.weight) * std
+                        module.weight.copy_(new_weights)
+
+                        # nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Input tensor of shape (batch_size, seq_length, input_dim)
+            x: (batch_size, seq_length, input_dim)
         Returns:
-            output: Output tensor of shape (batch_size, seq_length, d_model)
+            (batch_size, seq_length, d_model)
         """
-        # Embed input
-        x = self.input_embedding(x)  # (batch_size, seq_length, d_model)
-        
-        # Process through multiple Mamba2 layers with residual connections
+        # 1) Input embedding
+        x = self.input_embedding(x)  # → (B, L, d_model)
+
+        # 2) Mamba2 stacks with residuals
         for mamba_layer, layer_norm in zip(self.mamba_layers, self.layer_norms):
             residual = x
             x = layer_norm(x)
             x = mamba_layer(x)
             x = x + residual
-        
-        # Final layer norm
+
+        # 3) Final normalization
         x = self.final_layer_norm(x)
         return x
 
 
+@dataclass
+class RoutingOutput:
+    """Output from the routing module following H-Net's structure"""
+    boundary_prob: torch.Tensor      # [batch_size, seq_len, 2] - probability distribution
+    boundary_mask: torch.Tensor      # [batch_size, seq_len] - binary boundary indicators  
+    selected_probs: torch.Tensor     # [batch_size, seq_len, 1] - selected probabilities
+
+class RoutingModule(nn.Module):
+    """
+    Simplified routing module following H-Net's dynamic chunking approach.
+    Creates boundary masks for downstream pooling operations.
+    """
+
+    def __init__(self, config: TimeMoeConfig, device=None, dtype=None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        
+        # factory_kwargs = {"device": device, "dtype": dtype}
+        
+        # Query and key projections following H-Net design
+        self.q_proj_layer = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj_layer = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+
+        # Initialize as identity matrices for stable training
+        with torch.no_grad():
+            self.q_proj_layer.weight.copy_(torch.eye(self.hidden_size))
+            self.k_proj_layer.weight.copy_(torch.eye(self.hidden_size))
+            
+        # Prevent reinitialization
+        self.q_proj_layer.weight._no_reinit = True
+        self.k_proj_layer.weight._no_reinit = True
+
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        threshold: float = 0.5
+    ) -> RoutingOutput:
+        """
+        Create boundary masks using H-Net's cosine similarity approach.
+        
+        Args:
+            hidden_states: Input embeddings [batch_size, seq_len, hidden_size]
+            attention_mask: Optional attention mask [batch_size, seq_len]
+            threshold: Fixed threshold for boundary detection (default: 0.5)
+            
+        Returns:
+            RoutingOutput with boundary information
+        """        
+        # Compute cosine similarity between adjacent representations
+        cos_sim = torch.einsum(
+            "b l d, b l d -> b l",
+            F.normalize(self.q_proj_layer(hidden_states[:, :-1]), dim=-1),
+            F.normalize(self.k_proj_layer(hidden_states[:, 1:]), dim=-1),
+        )
+
+        boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
+
+        # Force boundary probability of the first element to 1.0
+        PAD_PROB = 1.0
+        boundary_prob = F.pad(boundary_prob, (1, 0), "constant", PAD_PROB)
+
+        boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
+
+        selected_idx = torch.argmax(boundary_prob, dim=-1)
+
+        boundary_mask = selected_idx == 1  # (shape hidden_states.shape[:-1])
+        
+        selected_probs = boundary_prob.gather(
+            dim=-1, index=selected_idx.unsqueeze(-1)
+        )
+        return RoutingOutput(
+            boundary_prob=boundary_prob,
+            boundary_mask=boundary_mask,
+            selected_probs=selected_probs
+        )
+
+class ChunkLayer(nn.Module):
+
+    def forward(self, hidden_states, boundary_mask):
+
+        num_tokens = boundary_mask.sum(dim=-1)
+        next_max_seqlen = int(num_tokens.max())
+
+        device = hidden_states.device
+        L = hidden_states.shape[1]
+        token_idx = (
+            torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+        )
+        seq_sorted_indices = torch.argsort(token_idx, dim=1)
+
+        next_hidden_states = torch.gather(
+            hidden_states,
+            dim=1,
+            index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
+                -1, -1, hidden_states.shape[-1]
+            ),
+        )
+
+        # mask to indicate padded positions; to be used by the latent transformer
+        embeds_mask = (torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None])
+
+        return next_hidden_states, embeds_mask
+
+def compute_ratio_loss(boundary_mask, selected_probs, N=4.0):
+    """
+    Compute the auxiliary ratio loss L_ratio for controlling compression ratios.
+    This should be called immediately after the chunking layer.
+    
+    Args:
+        boundary_mask (torch.Tensor): Binary boundary indicators [batch_size, seq_len]  
+        selected_probs (torch.Tensor): Boundary probabilities [batch_size, seq_len]
+        N (float): Target compression ratio (e.g., 6.0 for 6:1 compression)
+        
+    Returns:
+        torch.Tensor: Scalar ratio loss
+    """
+    L = boundary_mask.shape[1]  # sequence length
+    
+    # F = fraction of vectors actually selected (discrete)
+    F = boundary_mask.float().sum(dim=-1) / L  # [batch_size]
+    F = F.mean()  # average across batch
+    
+    # G = average boundary probability (continuous)
+    G = selected_probs.mean()
+    
+    # Compute ratio loss: L_ratio = N/(N-1) * ((N-1)*F*G + (1-F)*(1-G))
+    L_ratio = (N / (N - 1)) * ((N - 1) * F * G + (1 - F) * (1 - G))
+    
+    return L_ratio
+
+class DeChunkLayer(nn.Module):
+
+    def __init__(self, config: TimeMoeConfig):
+        super().__init__()
+        self.config = config
+        # self.d_model = d_model
+
+        # Just for Mamba2 kernel.
+        self.dtype = torch.bfloat16 #config.mamba_dtype
+        self.block_size = config.block_size
+        self.headdim = config.headdim
+        assert config.hidden_size % self.headdim == 0
+        self.nheads = config.hidden_size // self.headdim
+
+    def forward(
+        self,
+        hidden_states,
+        boundary_mask,
+        boundary_prob,
+    ):
+
+        p = torch.clamp(boundary_prob[..., -1].float(), min=1e-4, max=1 - (1e-4))
+
+        B, L = boundary_mask.shape
+        seq_idx = None
+
+        token_idx = (
+            torch.arange(L, device=hidden_states.device)[None, :]
+            + (~boundary_mask).long() * L
+        )
+        seq_sorted_indices = torch.argsort(token_idx, dim=1)
+
+        p = torch.gather(
+            p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
+        )  # (B, M)
+
+        original_dtype = hidden_states.dtype
+        # Reuse Mamba2 kernel for EMA Deaggregator.
+        dt = torch.log(1 / (1 - p)).to(self.dtype)
+        x = (hidden_states / dt[..., None]).to(self.dtype)
+        A = -torch.ones(
+            (self.nheads,), device=hidden_states.device, dtype=torch.float32
+        )
+        b = p.to(self.dtype)
+        c = torch.ones_like(b)
+
+        out = mamba_chunk_scan_combined(
+            rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
+            repeat(dt, "b l -> b l h", h=self.nheads),
+            A,
+            rearrange(b, "b l -> b l 1 1"),
+            rearrange(c, "b l -> b l 1 1"),
+            chunk_size=self.block_size,
+            seq_idx=seq_idx,
+        )
+        out = rearrange(out, "b l h p -> b l (h p)")
+
+        plug_back_idx = torch.cumsum(boundary_mask, dim=1) - 1  # (B, L)
+        out = torch.gather(
+            out,
+            dim=1,
+            index=plug_back_idx.unsqueeze(-1).expand(-1, -1, self.d_model),
+        )
+
+        return out.to(original_dtype)
+
 class MambaDecoder(nn.Module):
     """
-    Pure Mamba decoder without upsampling logic.
+    Mamba2-based decoder for Time-MoE models.
     """
-    def __init__(
-        self,
-        d_model: int = 384,
-        output_dim: int = 384,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        n_layers: int = 2,
-    ):
+    def __init__(self, config: TimeMoeConfig):
+
         super().__init__()
-        self.d_model = d_model
-        self.output_dim = output_dim
-        self.n_layers = n_layers
+        self.config = config
         
         # Multiple Mamba2 layers with layer normalization
         self.mamba_layers = nn.ModuleList()
         self.layer_norms = nn.ModuleList()
-        
-        for _ in range(n_layers):
-            self.mamba_layers.append(Mamba2(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            ))
-            self.layer_norms.append(TimeMoeRMSNorm(d_model, eps=1e-6))
 
-        self.final_layer_norm = TimeMoeRMSNorm(d_model, eps=1e-6)
+        for _ in range(config.num_decoder_layers):
+            self.mamba_layers.append(Mamba2(
+                d_model=config.hidden_size,
+                d_state=config.d_state,
+                d_conv=config.d_conv,
+                expand=config.expand,
+            ))
+            self.layer_norms.append(TimeMoeRMSNorm(config.hidden_size, eps=1e-6))
+
+        self.final_layer_norm = TimeMoeRMSNorm(config.hidden_size, eps=1e-6)
         
         # Output projection
-        self.output_projection = nn.Linear(d_model, output_dim)
-        self.final_layer_norm = TimeMoeRMSNorm(d_model, eps=1e-6)
+        self.output_projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.final_layer_norm = TimeMoeRMSNorm(config.hidden_size, eps=1e-6)
 
-    def forward(self, x, encoder_embeddings=None):
+        # Re‑init all Conv1d and Linear weights to a sane uniform range
+        self._init_conv1d()
+
+    def _init_conv1d(self):
+        """
+        FIX ME: Reinitialize only Conv1d layers inside Mamba layers with normal initialization
+        """
+        for mamba_layer in self.mamba_layers:
+            for module in mamba_layer.modules():
+                if isinstance(module, nn.Conv1d):
+                    with torch.no_grad():
+                        fan_in = module.weight.size(1) * module.weight.size(2)  # in_channels * kernel_size
+                        std = (2.0 / fan_in) ** 0.5  # Kaiming std for ReLU/SiLU
+                        new_weights = torch.randn_like(module.weight) * std
+                        module.weight.copy_(new_weights)
+
+                        # nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+
+    def forward(self, x):
         """
         Args:
             x: Decoder input tensor of shape (batch_size, seq_length, d_model)
-            encoder_embeddings: Optional encoder embeddings for residual connection
         Returns:
             Output tensor of shape (batch_size, seq_length, output_dim)
         """
-        # Add encoder embeddings if provided (residual connection from encoder)
-        if encoder_embeddings is not None:
-            x = x + encoder_embeddings
-        
         # Process through multiple Mamba2 layers with residual connections
         for mamba_layer, layer_norm in zip(self.mamba_layers, self.layer_norms):
             residual = x
@@ -1145,15 +1373,27 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 self.encoder = LinearEncoder(config)
                 self.decoder = LinearDecoder(config)
         elif config.patch_embedding_type == "mamba":
-            self.encoder = MambaEncoder()
-            self.downsample = Downsampling(1024,256)
+            self.encoder = MambaEncoder(config)
+            self.decoder = MambaDecoder(config)
 
-            self.decoder = MambaDecoder()
-            self.upsample = Upsampling(256, 1024)
+            if config.patching_strategy == "fixed":
+                self.downsample = Downsampling(config.patch_size)
+                self.upsample = Upsampling(config.patch_size)
+            else:
+                self.routing_module = RoutingModule(config)
+                self.chunk_layer = ChunkLayer()
+                self.dechunk_layer = DeChunkLayer(config)
+
+                # do the residual in fp32
+                self.residual_proj = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
+                nn.init.zeros_(self.residual_proj.weight)
+                self.residual_proj.weight._no_reinit = True
+                self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
+
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-
+ 
         self._attn_implementation = config._attn_implementation
         self.norm = TimeMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1209,10 +1449,23 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
+        loss_ratio = None
         if inputs_embeds is None:
             encoder_embeddings = self.encoder(input_ids)
-            if hasattr(self, 'downsample'):
+
+            if self.config.patching_strategy == "fixed":
                 inputs_embeds = self.downsample(encoder_embeddings)
+            else:
+                encoder_embeddings_for_residual = encoder_embeddings.to(dtype=self.residual_proj.weight.dtype)
+                residual = self.residual_proj(encoder_embeddings_for_residual)
+
+                routing_output = self.routing_module(encoder_embeddings)
+
+                inputs_embeds, embeds_mask = self.chunk_layer(encoder_embeddings, routing_output.boundary_mask)
+
+                # compute auxiliary loss for controlling compression ratio
+                loss_ratio = compute_ratio_loss(routing_output.boundary_mask, routing_output.selected_probs, 4)
+                
         batch_size, seq_length, _ = inputs_embeds.shape
     
         if position_ids is None:
@@ -1229,6 +1482,9 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         # truncate the attention mask to match the input sequence length
         if attention_mask is not None:
             attention_mask = attention_mask[:seq_length, :seq_length]
+
+        if embeds_mask is not None:
+            attention_mask = embeds_mask.to(attention_mask.dtype) if attention_mask is not None else embeds_mask
         
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -1290,8 +1546,12 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         # project back to the input space
         if hasattr(self, 'upsample'):
             hidden_states = self.upsample(hidden_states)
-        if hasattr(self, 'decoder'):
-            hidden_states = self.decoder(hidden_states, encoder_embeddings)
+
+        hidden_states = self.dechunk_layer(hidden_states,routing_output.boundary_mask,routing_output.boundary_prob)
+
+        hidden_states = self.residual_func(hidden_states.to(dtype=residual.dtype), residual, routing_output.selected_probs).to(hidden_states.dtype)
+
+        hidden_states = self.decoder(hidden_states)
     
         next_cache = None
         if use_cache:
@@ -1309,7 +1569,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits
-        )
+        ), loss_ratio
 
 
 class TimeMoeOutputLayer(nn.Module):
@@ -1393,7 +1653,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs, loss_ratio = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1451,6 +1711,10 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             output = (predictions,) + outputs[1:]
             return (loss, aux_loss) + output if loss is not None else output
 
+        ## fix me: add ratio_loss
+        if loss_ratio is not None:
+            loss = loss + 0.01 * loss_ratio
+    
         return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,

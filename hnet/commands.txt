@@ -1,0 +1,1 @@
+python generate.py --model-path ./model_weights/hnet_2stage_XL.pt --config-path configs/hnet_2stage_XL.json --max-tokens 1024 --temperature 1.0 --top-p 1.0

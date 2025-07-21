@@ -11,12 +11,23 @@ class TimeMoeConfig(PretrainedConfig):
             input_size: int = 1,
             patch_size: int = 4,
             patching_strategy: str = "adaptive",  # "fixed" or "adaptive"
-            patch_embedding_type: str = "transformer",  # "transformer" or "linear"
-            use_unpatchify: bool = True,  # Whether to use unpatchify module
-            num_patchify_layers: int = 2, 
-            num_unpatchify_layers: int = 2,
+            patch_embedding_type: str = "mamba",  # "linear", "mamba", "xformer"
+            use_decoder: bool = True,  # fix me: for now mamba always uses decoder
+            num_encoder_layers: int = 2, 
+            num_decoder_layers: int = 2,
+
+            # xformer parameters
             num_patch_attention_heads: int = 4,  # Number of attention heads for patch embeddings
             local_attention_window_size: int = 32,  # Window size for local self-attention
+
+            # mamba parameters
+            d_state: int = 128,  # State dimension for Mamba
+            d_conv: int = 4,  # 1D Convolution dimension for Mamba
+            expand: int = 2,  # Expansion factor for Mamba
+            block_size: int = 256,  # Block size for mamba_chunk_scan_combined
+            headdim: int = 32,  # Head dimension for mamba_chunk_scan_combined
+            # mamba_dtype = torch.bfloat16,  # Data type for Mamba
+
             entropy_batch_size = 256,  # Batch size for entropy calculations
             # Model architecture parameters
             hidden_size: int = 4096,
@@ -46,9 +57,15 @@ class TimeMoeConfig(PretrainedConfig):
         self.local_attention_window_size = local_attention_window_size
         self.patch_embedding_type = patch_embedding_type
         self.entropy_batch_size = entropy_batch_size
-        self.use_unpatchify = use_unpatchify
-        self.num_patchify_layers = num_patchify_layers
-        self.num_unpatchify_layers = num_unpatchify_layers
+        self.use_decoder = use_decoder
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.block_size = block_size
+        self.headdim = headdim
+        # self.mamba_dtype = mamba_dtype
         self.num_patch_attention_heads = num_patch_attention_heads
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -76,10 +93,6 @@ class TimeMoeConfig(PretrainedConfig):
         self.router_aux_loss_factor = router_aux_loss_factor
 
         assert self.use_dense ^ self.apply_aux_loss, 'Both use_dense and apply_aux_loss cannot be set to True or False at the same time.'
-
-        # Validate patch embedding type
-        if patch_embedding_type not in ["linear", "transformer"]:
-            raise ValueError(f"patch_embedding_type must be either 'linear' or 'transformer', got '{patch_embedding_type}'")
 
         kwargs.pop('tie_word_embeddings', None)
         super().__init__(

@@ -213,7 +213,7 @@ class Downsampling(nn.Module):
     def __init__(
         self,
         sampling_factor: int,
-        pooling_type: Literal["max", "min", "avg", "boundary"] = "max"
+        pooling_type: Literal["max", "min", "avg", "boundary"] = "boundary"
     ):
         super().__init__()
         self.sampling_factor = sampling_factor
@@ -665,7 +665,7 @@ class DeChunkLayer(nn.Module):
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.config = config
-        # self.d_model = d_model
+        self.d_model = config.hidden_size
 
         # Just for Mamba2 kernel.
         self.dtype = torch.bfloat16 #config.mamba_dtype
@@ -1450,22 +1450,24 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
         loss_ratio = None
+        embed_masks = None
         if inputs_embeds is None:
             encoder_embeddings = self.encoder(input_ids)
+            if self.config.patch_embedding_type != "linear":
+                if self.config.patching_strategy == "fixed":
+                    inputs_embeds = self.downsample(encoder_embeddings)
+                else:
+                    encoder_embeddings_for_residual = encoder_embeddings.to(dtype=self.residual_proj.weight.dtype)
+                    residual = self.residual_proj(encoder_embeddings_for_residual)
 
-            if self.config.patching_strategy == "fixed":
-                inputs_embeds = self.downsample(encoder_embeddings)
+                    routing_output = self.routing_module(encoder_embeddings)
+
+                    inputs_embeds, embeds_mask = self.chunk_layer(encoder_embeddings, routing_output.boundary_mask)
+
+                    # compute auxiliary loss for controlling compression ratio
+                    loss_ratio = compute_ratio_loss(routing_output.boundary_mask, routing_output.selected_probs, 4)
             else:
-                encoder_embeddings_for_residual = encoder_embeddings.to(dtype=self.residual_proj.weight.dtype)
-                residual = self.residual_proj(encoder_embeddings_for_residual)
-
-                routing_output = self.routing_module(encoder_embeddings)
-
-                inputs_embeds, embeds_mask = self.chunk_layer(encoder_embeddings, routing_output.boundary_mask)
-
-                # compute auxiliary loss for controlling compression ratio
-                loss_ratio = compute_ratio_loss(routing_output.boundary_mask, routing_output.selected_probs, 4)
-                
+                inputs_embeds = encoder_embeddings
         batch_size, seq_length, _ = inputs_embeds.shape
     
         if position_ids is None:
@@ -1544,12 +1546,13 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         # project back to the input space
-        if hasattr(self, 'upsample'):
-            hidden_states = self.upsample(hidden_states)
+        if self.config.patch_embedding_type != "linear":
+            if self.config.patching_strategy == "fixed":
+                hidden_states = self.upsample(hidden_states)
+            else:
+                hidden_states = self.dechunk_layer(hidden_states,routing_output.boundary_mask,routing_output.boundary_prob)
 
-        hidden_states = self.dechunk_layer(hidden_states,routing_output.boundary_mask,routing_output.boundary_prob)
-
-        hidden_states = self.residual_func(hidden_states.to(dtype=residual.dtype), residual, routing_output.selected_probs).to(hidden_states.dtype)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual.dtype), residual, routing_output.selected_probs).to(hidden_states.dtype)
 
         hidden_states = self.decoder(hidden_states)
     
@@ -1711,8 +1714,8 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
             output = (predictions,) + outputs[1:]
             return (loss, aux_loss) + output if loss is not None else output
 
-        ## fix me: add ratio_loss
-        if loss_ratio is not None:
+        ## add loss_ratio
+        if loss is not None and loss_ratio is not None:
             loss = loss + 0.01 * loss_ratio
     
         return MoeCausalLMOutputWithPast(

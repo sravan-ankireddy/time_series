@@ -463,8 +463,8 @@ class MambaEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # Input embedding: project from input_dim to d_model
-        self.input_embedding = nn.Linear(config.input_size, config.hidden_size)
+        # # Input embedding: project from input_dim to d_model
+        # self.input_embedding = nn.Linear(config.input_size, config.hidden_size)
 
         # Build Mamba2 layers + RMS‐norms
         self.mamba_layers = nn.ModuleList()
@@ -513,8 +513,8 @@ class MambaEncoder(nn.Module):
         Returns:
             (batch_size, seq_length, d_model)
         """
-        # 1) Input embedding
-        x = self.input_embedding(x)  # → (B, L, d_model)
+        # # 1) Input embedding
+        # x = self.input_embedding(x)  # → (B, L, d_model)
 
         # 2) Mamba2 stacks with residuals
         for mamba_layer, layer_norm in zip(self.mamba_layers, self.layer_norms):
@@ -1363,7 +1363,6 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__(config)
-        # self.embed_layer = TimeMoeInputEmbedding(config)
         self.config = config
 
         if config.patch_embedding_type == "linear":
@@ -1373,21 +1372,37 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 self.encoder = LinearEncoder(config)
                 self.decoder = LinearDecoder(config)
         elif config.patch_embedding_type == "mamba":
-            self.encoder = MambaEncoder(config)
-            self.decoder = MambaDecoder(config)
+            self.embed_layer = TimeMoeInputEmbedding(config)
+            self.encoder_1 = MambaEncoder(config)
+            self.decoder_1 = MambaDecoder(config)
+
+            self.encoder_2 = MambaEncoder(config)
+            self.decoder_2 = MambaDecoder(config)
 
             if config.patching_strategy == "fixed":
-                self.downsample = Downsampling(config.patch_size)
-                self.upsample = Upsampling(config.patch_size)
+                self.downsample_1 = Downsampling(config.patch_size)
+                self.upsample_1 = Upsampling(config.patch_size)
+
+                self.downsample_2 = Downsampling(config.patch_size_2)
+                self.upsample_2 = Upsampling(config.patch_size_2)
             else:
-                self.routing_module = RoutingModule(config)
+                self.routing_module_1 = RoutingModule(config)
+                self.routing_module_2 = RoutingModule(config)
                 self.chunk_layer = ChunkLayer()
                 self.dechunk_layer = DeChunkLayer(config)
 
-                # do the residual in fp32
-                self.residual_proj = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
-                nn.init.zeros_(self.residual_proj.weight)
-                self.residual_proj.weight._no_reinit = True
+            # do the residual in fp32
+            self.residual_proj_1 = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
+            nn.init.zeros_(self.residual_proj_1.weight)
+            self.residual_proj_1.weight._no_reinit = True
+
+            self.residual_proj_2 = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
+            nn.init.zeros_(self.residual_proj_2.weight)
+            self.residual_proj_2.weight._no_reinit = True
+
+            if config.patching_strategy == "fixed":
+                self.residual_func = lambda out, residual: out + residual
+            else:
                 self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
 
         self.layers = nn.ModuleList(
@@ -1449,26 +1464,63 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
-        loss_ratio = None
-        embed_masks = None
+        loss_ratio_total = None
+        embed_masks_1, embed_masks_2 = None, None
+        residual_1, residual_2 = None, None
         if inputs_embeds is None:
-            encoder_embeddings = self.encoder(input_ids)
-            if self.config.patch_embedding_type != "linear":
-                if self.config.patching_strategy == "fixed":
-                    inputs_embeds = self.downsample(encoder_embeddings)
-                else:
-                    encoder_embeddings_for_residual = encoder_embeddings.to(dtype=self.residual_proj.weight.dtype)
-                    residual = self.residual_proj(encoder_embeddings_for_residual)
+            # pass the inputs through the encoder
+            if self.config.patch_embedding_type == "linear":
+                encoder_embeddings = self.encoder(input_ids)
+                inputs_embeds = encoder_embeddings
+            else:
+                # project inputs to the embedding space
+                point_inputs_embeds = self.embed_layer(input_ids)
 
-                    routing_output = self.routing_module(encoder_embeddings)
+                if self.config.patching_strategy == "fixed":
+                    encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
+
+                    encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                    residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                    encoder_embeddings_1 = self.downsample_1(encoder_embeddings_1)
+
+                    encoder_embeddings_2 = self.encoder_2(encoder_embeddings_1)
+
+                    encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                    residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
+                    inputs_embeds = self.downsample_2(encoder_embeddings_2)
+                else:
+                    encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
+                    routing_output_1 = self.routing_module_1(encoder_embeddings_1)
+
+                    encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                    residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                    encoder_embeddings_1, embed_masks_1 = self.chunk_layer(encoder_embeddings_1, routing_output_1.boundary_mask)
+
+                    encoder_embeddings_2 = self.encoder_2(encoder_embeddings_1)
+
+                    encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                    residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
+                    routing_output_2 = self.routing_module_2(encoder_embeddings_2)
+                    encoder_embeddings_2, embed_masks_2 = self.chunk_layer(encoder_embeddings_2, routing_output_2.boundary_mask)
+
+                    # compute auxiliary loss for controlling compression ratio
+                    loss_ratio_1 = compute_ratio_loss(routing_output_1.boundary_mask, routing_output_1.boundary_prob[:,:,-1], 4)
+                    loss_ratio_2 = compute_ratio_loss(routing_output_2.boundary_mask, routing_output_2.boundary_prob[:,:,-1], 4)
+
+                    loss_ratio_total = loss_ratio_1 + loss_ratio_2
                     # from .extra_utils import plot_signal_and_mask
                     # plot_signal_and_mask(input_ids, routing_output.boundary_mask)
-                    # inputs_embeds, embed_masks = self.chunk_layer(encoder_embeddings, routing_output.boundary_mask)
                     # breakpoint()
-                    # compute auxiliary loss for controlling compression ratio
-                    loss_ratio = compute_ratio_loss(routing_output.boundary_mask, routing_output.boundary_prob[:,:,-1], 4)
-            else:
-                inputs_embeds = encoder_embeddings
+                # encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                # residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                # encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                # residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
         batch_size, seq_length, _ = inputs_embeds.shape
     
         if position_ids is None:
@@ -1486,8 +1538,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if attention_mask is not None:
             attention_mask = attention_mask[:seq_length, :seq_length]
 
-        if embed_masks is not None:
-            attention_mask = embed_masks.to(attention_mask.dtype) if attention_mask is not None else embed_masks
+        if embed_masks_2 is not None:
+            attention_mask = embed_masks_2.to(attention_mask.dtype) if attention_mask is not None else embed_masks_2
         
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -1549,13 +1601,24 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         # project back to the input space
         if self.config.patch_embedding_type != "linear":
             if self.config.patching_strategy == "fixed":
-                hidden_states = self.upsample(hidden_states)
+                hidden_states = self.upsample_2(hidden_states)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2).to(hidden_states.dtype)
+                hidden_states = self.decoder_2(hidden_states)
+
+                hidden_states = self.upsample_1(hidden_states)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1).to(hidden_states.dtype)
+                hidden_states = self.decoder_1(hidden_states)
             else:
-                hidden_states = self.dechunk_layer(hidden_states,routing_output.boundary_mask,routing_output.boundary_prob)
+                hidden_states = self.dechunk_layer_2(hidden_states, routing_output_2.boundary_mask, routing_output_2.boundary_prob)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2, routing_output_2.selected_probs).to(hidden_states.dtype)
+                hidden_states = self.decoder_2(hidden_states)
 
-                hidden_states = self.residual_func(hidden_states.to(dtype=residual.dtype), residual, routing_output.selected_probs).to(hidden_states.dtype)
+                hidden_states = self.dechunk_layer_1(hidden_states, routing_output_1.boundary_mask, routing_output_1.boundary_prob)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1, routing_output_1.selected_probs).to(hidden_states.dtype)
+                hidden_states = self.decoder_1(hidden_states)
 
-        hidden_states = self.decoder(hidden_states)
+        else:
+            hidden_states = self.decoder(hidden_states)
     
         next_cache = None
         if use_cache:
@@ -1573,7 +1636,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits
-        ), loss_ratio
+        ), loss_ratio_total
 
 
 class TimeMoeOutputLayer(nn.Module):

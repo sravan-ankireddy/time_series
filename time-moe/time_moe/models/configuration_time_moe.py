@@ -9,9 +9,11 @@ class TimeMoeConfig(PretrainedConfig):
     def __init__(
             self,
             input_size: int = 1,
-            patch_size: int = 4,
-            patching_strategy: str = "adaptive",  # "fixed" or "adaptive"
+            patch_size: int = 2,
+            patch_size_2: int = 2,
+            patching_strategy: str = "fixed",  # "fixed" or "adaptive"
             patch_embedding_type: str = "mamba",  # "linear", "mamba", "xformer"
+            num_stages: int = 2,  # Number of stages of compression
             use_decoder: bool = True,  # fix me: for now mamba always uses decoder
             num_encoder_layers: int = 2, 
             num_decoder_layers: int = 2,
@@ -53,6 +55,7 @@ class TimeMoeConfig(PretrainedConfig):
     ):
         self.input_size = input_size
         self.patch_size = patch_size
+        self.patch_size_2 = patch_size_2
         self.patching_strategy = patching_strategy
         self.local_attention_window_size = local_attention_window_size
         self.patch_embedding_type = patch_embedding_type
@@ -60,6 +63,7 @@ class TimeMoeConfig(PretrainedConfig):
         self.use_decoder = use_decoder
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
+        self.num_stages = num_stages
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand

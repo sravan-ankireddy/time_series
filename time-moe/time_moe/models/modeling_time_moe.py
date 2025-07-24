@@ -218,9 +218,7 @@ class Downsampling(nn.Module):
         super().__init__()
         self.sampling_factor = sampling_factor
         self.pooling_type = pooling_type
-        # Check if downsampling is needed
-        self.needs_downsampling = sampling_factor > 1
-        
+
     def forward(self, x):
         """
         Args:
@@ -229,37 +227,41 @@ class Downsampling(nn.Module):
             Output tensor of shape (batch_size, output_length, dim)
             where output_length = input_length // sampling_factor
         """
-        if not self.needs_downsampling:
+        if self.sampling_factor == 1:
             return x
-            
+
         batch_size, input_length, dim = x.shape
         output_length = input_length // self.sampling_factor
+
+        if self.pooling_type == "boundary":
+            # For boundary pooling, we want elements at positions:
+            # sampling_factor-1, 2*sampling_factor-1, 3*sampling_factor-1, etc.
+            indices = torch.arange(
+                self.sampling_factor - 1, 
+                output_length * self.sampling_factor, 
+                self.sampling_factor,
+                device=x.device
+            )
+            return x[:, indices, :]
         
+        # For other pooling types
         output = []
         for i in range(output_length):
-            # Define causal window: from start to current boundary
             end_pos = min((i + 1) * self.sampling_factor, input_length)
-            # Extract causal window
-            window = x[:, :end_pos, :]  # (batch_size, window_length, dim)
+            window = x[:, :end_pos, :]
             
-            # Apply pooling strategy
             if self.pooling_type == "max":
-                pooled = window.max(dim=1)[0]  # (batch_size, dim)
+                pooled = window.max(dim=1)[0]
             elif self.pooling_type == "min":
-                pooled = window.min(dim=1)[0]  # (batch_size, dim)
+                pooled = window.min(dim=1)[0]
             elif self.pooling_type == "avg":
-                pooled = window.mean(dim=1)  # (batch_size, dim)
-            elif self.pooling_type == "boundary":
-                # Take the last element in the causal window
-                pooled = window[:, -1, :]  # (batch_size, dim)
+                pooled = window.mean(dim=1)
             else:
                 raise ValueError(f"Unknown pooling type: {self.pooling_type}")
-                
-            output.append(pooled)
             
-        # Stack outputs
-        output = torch.stack(output, dim=1)  # (batch_size, output_length, dim)
-        return output
+            output.append(pooled)
+        
+        return torch.stack(output, dim=1)
 
 
 class Upsampling(nn.Module):
@@ -272,8 +274,6 @@ class Upsampling(nn.Module):
     ):
         super().__init__()
         self.sampling_factor = sampling_factor
-        # Check if upsampling is needed
-        self.needs_upsampling = sampling_factor > 1
         
     def forward(self, x):
         """
@@ -283,61 +283,36 @@ class Upsampling(nn.Module):
             Output tensor of shape (batch_size, output_length, dim)
             where output_length = input_length * sampling_factor
         """
-        if not self.needs_upsampling:
-            return x
-            
         # Repeat each embedding by the sampling factor
-        # (a,b,c) becomes (a,a,a,a,b,b,b,b,c,c,c,c) for sampling_factor=4
         upsampled = x.repeat_interleave(self.sampling_factor, dim=1)
         return upsampled
 
-
 class LinearEncoder(nn.Module):
     """
-    Combined input embedding and patch embedding module that directly processes raw input.
-    This is a more efficient alternative to the transformer-based TimeMoePatchEmbedding.
+    Simple linear encoder that reduces sequence length by grouping consecutive embeddings.
     
     The approach:
-    1. Groups consecutive time points into patches of size `patch_size`
-    2. Flattens each patch: [patch_size, input_size] -> [patch_size * input_size]
-    3. Projects via linear layer: [patch_size * input_size] -> [hidden_size]
-    4. Applies layer normalization for stability
+    1. Groups consecutive embeddings into patches of size `patch_size`
+    2. Applies simple linear transformation to combine embeddings within each patch
+    3. Reduces sequence length by factor of `patch_size` while preserving feature dimension
     
-    This combines input embedding and patch embedding in one step, reducing computation
-    and memory usage compared to first embedding each point then combining patches.
-    
-    Compared to TimeMoePatchEmbedding:
-    - 95%+ fewer parameters (no cross-attention layers)
-    - Much faster computation (single matrix multiplication vs. multiple attention layers)
-    - Simpler and more stable training
-    - More efficient by combining input and patch embedding steps
-    - Still captures patch-level information effectively for many time series tasks
+    For example: input [4, 1024, 384] with patch_size=4 -> output [4, 256, 384]
+    Projects 4x384 -> 1x384 (combining 4 consecutive embeddings into 1)
     """
 
-    def __init__(self, config: TimeMoeConfig):
+    def __init__(self, config: TimeMoeConfig, patch_size: int = 4):
         super().__init__()
         self.config = config
-        self.patch_size = config.patch_size
-        self.input_size = config.input_size
-        self.hidden_size = config.hidden_size
+        self.patch_size = patch_size
+        self.hidden_size = config.hidden_size  # Use hidden_size for embedding dimension
         
-        # Combined input + patch embedding: directly from raw input to patch embeddings
-        # Takes patch_size * input_size input and outputs hidden_size (one embedding per patch)
+        # Simple linear projection to combine patch_size embeddings into one
+        # Takes patch_size * hidden_size and outputs hidden_size (preserving feature dimension)
         self.patch_projection = nn.Linear(
-            self.patch_size * self.input_size, 
-            self.hidden_size, 
+            self.patch_size * self.hidden_size, 
+            self.hidden_size,  # Keep same feature dimension
             bias=True
         )
-        
-        # Gate projection for gating mechanism (similar to TimeMoeInputEmbedding)
-        self.gate_projection = nn.Linear(
-            self.patch_size * self.input_size, 
-            self.hidden_size, 
-            bias=True
-        )
-        
-        # Activation function
-        self.act_fn = ACT2FN[config.hidden_act]
         
         # Optional layer norm for stability
         self.layer_norm = TimeMoeRMSNorm(self.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-6))
@@ -345,70 +320,61 @@ class LinearEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x (torch.Tensor): Raw input of shape [batch_size, seq_len, input_size]
+            x (torch.Tensor): Input embeddings of shape [batch_size, seq_len, hidden_size]
+                             e.g., [4, 1024, 384]
         
         Returns:
-            torch.Tensor: Patch embeddings of shape [batch_size, num_patches, hidden_size]
+            torch.Tensor: Reduced embeddings of shape [batch_size, seq_len//patch_size, hidden_size]
+                         e.g., [4, 256, 384]
         """
-        batch_size, seq_len, input_size = x.shape
+        batch_size, seq_len, hidden_size = x.shape
         
         # Calculate number of patches
         num_patches = seq_len // self.patch_size
         
-        if num_patches == 0:
-            # If sequence length is smaller than patch size, pad to at least one patch
-            pad_length = self.patch_size - seq_len
-            x_padded = F.pad(x, (0, 0, 0, pad_length), mode='constant', value=0)
-            num_patches = 1
-            truncated_seq_len = self.patch_size
-            x_truncated = x_padded
-        else:
-            # Truncate sequence to make it divisible by patch_size
-            truncated_seq_len = num_patches * self.patch_size
-            x_truncated = x[:, :truncated_seq_len, :]
+        # Truncate sequence to make it divisible by patch_size
+        truncated_seq_len = num_patches * self.patch_size
+        x_truncated = x[:, :truncated_seq_len, :]
         
-        # Reshape to group sequences into patches
-        # [batch_size, num_patches, patch_size, input_size]
-        patches = x_truncated.view(batch_size, num_patches, self.patch_size, input_size)
+        # Reshape to group consecutive embeddings into patches
+        # [batch_size, num_patches, patch_size, hidden_size]
+        # e.g., [4, 256, 4, 384]
+        patches = x_truncated.view(batch_size, num_patches, self.patch_size, hidden_size)
         
-        # Flatten each patch: [batch_size, num_patches, patch_size * input_size]
-        flattened_patches = patches.view(batch_size, num_patches, self.patch_size * input_size)
+        # Flatten each patch: [batch_size, num_patches, patch_size * hidden_size]
+        # e.g., [4, 256, 1536] (4 * 384 = 1536)
+        flattened_patches = patches.view(batch_size, num_patches, self.patch_size * hidden_size)
         
-        # Combined input + patch embedding with gating mechanism
-        # Similar to TimeMoeInputEmbedding but for patches
-        gate_output = self.act_fn(self.gate_projection(flattened_patches))
-        embed_output = self.patch_projection(flattened_patches)
-        patch_embeddings = gate_output * embed_output
+        # Apply simple linear transformation
+        # [4, 256, 1536] -> [4, 256, 384]
+        reduced_embeddings = self.patch_projection(flattened_patches)
         
         # Apply layer normalization
-        patch_embeddings = self.layer_norm(patch_embeddings)
+        reduced_embeddings = self.layer_norm(reduced_embeddings)
         
-        return patch_embeddings
+        return reduced_embeddings
+
 
 class LinearDecoder(nn.Module):
     """
-    Decoder module that projects patch embeddings back to point embeddings.
+    Simple decoder module that expands patch embeddings back to point embeddings.
     
     This module reverses the patching operation by expanding each patch embedding
     into multiple point embeddings, enabling fine-grained temporal predictions.
     
-    For the linear patch embedding case, this module:
-    1. Takes patch embeddings of shape [batch_size, num_patches, hidden_size]
-    2. Projects each patch embedding to patch_size point embeddings
-    3. Outputs point embeddings of shape [batch_size, seq_len, hidden_size]
-    
-    This allows the model to make predictions at the original temporal resolution
-    rather than just at the patch level.
+    For example: input [4, 256, 384] with patch_size=4 -> output [4, 1024, 384]
+    Projects 1x384 -> 4x384 (expanding 1 embedding into 4 consecutive embeddings)
     """
     
-    def __init__(self, config: TimeMoeConfig):
+    def __init__(self, config: TimeMoeConfig, patch_size: int = 4):
         super().__init__()
         self.config = config
-        self.patch_size = config.patch_size
-        self.hidden_size = config.hidden_size
+        self.patch_size = patch_size
+        self.hidden_size = config.hidden_size  # Use hidden_size for embedding dimension
         
         # Project each patch embedding to patch_size point embeddings
         # Input: [hidden_size] -> Output: [patch_size * hidden_size]
+        # e.g., [384] -> [1536] (4 * 384 = 1536)
         self.unpatch_projection = nn.Linear(
             self.hidden_size,
             self.patch_size * self.hidden_size,
@@ -422,26 +388,28 @@ class LinearDecoder(nn.Module):
         """
         Args:
             patch_embeddings (torch.Tensor): Patch embeddings of shape [batch_size, num_patches, hidden_size]
+                                            e.g., [4, 256, 384]
             original_seq_len (int, optional): Original sequence length before patching
                                             If None, uses num_patches * patch_size
         
         Returns:
             torch.Tensor: Point embeddings of shape [batch_size, seq_len, hidden_size]
+                         e.g., [4, 1024, 384]
         """
         batch_size, num_patches, hidden_size = patch_embeddings.shape
         
         # Project patch embeddings to point embeddings
-        # [batch_size, num_patches, patch_size * hidden_size]
+        # [4, 256, 384] -> [4, 256, 1536] (1536 = 4 * 384)
         unpatch_output = self.unpatch_projection(patch_embeddings)
         
         # Reshape to separate patch_size dimension
-        # [batch_size, num_patches, patch_size, hidden_size]
+        # [4, 256, 1536] -> [4, 256, 4, 384]
         unpatch_reshaped = unpatch_output.view(
             batch_size, num_patches, self.patch_size, hidden_size
         )
         
         # Flatten to get point embeddings
-        # [batch_size, num_patches * patch_size, hidden_size]
+        # [4, 256, 4, 384] -> [4, 1024, 384] (256 * 4 = 1024)
         point_embeddings = unpatch_reshaped.view(
             batch_size, num_patches * self.patch_size, hidden_size
         )
@@ -455,6 +423,7 @@ class LinearDecoder(nn.Module):
         
         return point_embeddings
 
+
 class MambaEncoder(nn.Module):
     """
     Mamba2-based encoder for Time-MoE models.
@@ -463,8 +432,8 @@ class MambaEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # Input embedding: project from input_dim to d_model
-        self.input_embedding = nn.Linear(config.input_size, config.hidden_size)
+        # # Input embedding: project from input_dim to d_model
+        # self.input_embedding = nn.Linear(config.input_size, config.hidden_size)
 
         # Build Mamba2 layers + RMS‐norms
         self.mamba_layers = nn.ModuleList()
@@ -513,8 +482,8 @@ class MambaEncoder(nn.Module):
         Returns:
             (batch_size, seq_length, d_model)
         """
-        # 1) Input embedding
-        x = self.input_embedding(x)  # → (B, L, d_model)
+        # # 1) Input embedding
+        # x = self.input_embedding(x)  # → (B, L, d_model)
 
         # 2) Mamba2 stacks with residuals
         for mamba_layer, layer_norm in zip(self.mamba_layers, self.layer_norms):
@@ -1363,33 +1332,54 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__(config)
-        # self.embed_layer = TimeMoeInputEmbedding(config)
+        self.embed_layer = TimeMoeInputEmbedding(config)
         self.config = config
 
-        if config.patch_embedding_type == "linear":
-            if config.patch_size == 1:
-                self.encoder = TimeMoeInputEmbedding(config)
-            else:
-                self.encoder = LinearEncoder(config)
-                self.decoder = LinearDecoder(config)
+        if config.patch_embedding_type == "linear" and config.patch_size > 1:
+            self.encoder_1 = LinearEncoder(config, config.patch_size)
+            self.decoder_1 = LinearDecoder(config, config.patch_size)
+
+            if config.num_stages > 1:
+                self.encoder_2 = LinearEncoder(config, config.patch_size_2)
+                self.decoder_2 = LinearDecoder(config, config.patch_size_2)
+
         elif config.patch_embedding_type == "mamba":
-            self.encoder = MambaEncoder(config)
-            self.decoder = MambaDecoder(config)
+            self.encoder_1 = MambaEncoder(config)
+            self.decoder_1 = MambaDecoder(config)
+
+            if config.num_stages > 1:
+                self.encoder_2 = MambaEncoder(config)
+                self.decoder_2 = MambaDecoder(config)
 
             if config.patching_strategy == "fixed":
-                self.downsample = Downsampling(config.patch_size)
-                self.upsample = Upsampling(config.patch_size)
+                self.downsample_1 = Downsampling(config.patch_size)
+                self.upsample_1 = Upsampling(config.patch_size)
+                if config.num_stages > 1:
+                    self.downsample_2 = Downsampling(config.patch_size_2)
+                    self.upsample_2 = Upsampling(config.patch_size_2)
             else:
-                self.routing_module = RoutingModule(config)
+                self.routing_module_1 = RoutingModule(config)
+                if config.num_stages > 1:
+                    self.routing_module_2 = RoutingModule(config)
                 self.chunk_layer = ChunkLayer()
                 self.dechunk_layer = DeChunkLayer(config)
 
-                # do the residual in fp32
-                self.residual_proj = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
-                nn.init.zeros_(self.residual_proj.weight)
-                self.residual_proj.weight._no_reinit = True
-                self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
+        # do the residual in fp32
+        self.residual_proj_1 = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
+        nn.init.zeros_(self.residual_proj_1.weight)
+        self.residual_proj_1.weight._no_reinit = True
 
+        if config.num_stages > 1:
+            self.residual_proj_2 = nn.Linear(config.hidden_size, config.hidden_size, dtype=torch.float32)
+            nn.init.zeros_(self.residual_proj_2.weight)
+            self.residual_proj_2.weight._no_reinit = True
+
+        if config.patch_embedding_type == "mamba" and config.patching_strategy == "adaptive":
+            self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
+        else:
+            self.residual_func = lambda out, residual: out + residual
+
+        # main network
         self.layers = nn.ModuleList(
             [TimeMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1449,26 +1439,76 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
-        loss_ratio = None
-        embed_masks = None
+        loss_ratio_total = None
+        embed_masks_1, embed_masks_2 = None, None
+        residual_1, residual_2 = None, None
         if inputs_embeds is None:
-            encoder_embeddings = self.encoder(input_ids)
-            if self.config.patch_embedding_type != "linear":
-                if self.config.patching_strategy == "fixed":
-                    inputs_embeds = self.downsample(encoder_embeddings)
-                else:
-                    encoder_embeddings_for_residual = encoder_embeddings.to(dtype=self.residual_proj.weight.dtype)
-                    residual = self.residual_proj(encoder_embeddings_for_residual)
+            # project inputs to the embedding space
+            point_inputs_embeds = self.embed_layer(input_ids)
 
-                    routing_output = self.routing_module(encoder_embeddings)
+            # pass the inputs through the encoder
+            if self.config.patch_embedding_type == "linear" and self.config.patch_size > 1:
+                encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
+                encoder_embeddings_for_residual_1 = point_inputs_embeds.to(dtype=self.residual_proj_1.weight.dtype)
+                residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                if self.config.num_stages > 1:
+                    encoder_embeddings_2 = self.encoder_2(encoder_embeddings_1)
+                    encoder_embeddings_for_residual_2 = encoder_embeddings_1.to(dtype=self.residual_proj_2.weight.dtype)
+                    residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
+                    inputs_embeds = encoder_embeddings_2
+                else:
+                    inputs_embeds = encoder_embeddings_1
+            else:
+                if self.config.patching_strategy == "fixed":
+                    encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
+
+                    encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                    residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                    inputs_embeds = self.downsample_1(encoder_embeddings_1)
+
+                    if self.config.num_stages > 1:
+                        encoder_embeddings_2 = self.encoder_2(inputs_embeds)
+
+                        encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                        residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
+                        inputs_embeds = self.downsample_2(encoder_embeddings_2)
+
+                else:
+                    encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
+                    routing_output_1 = self.routing_module_1(encoder_embeddings_1)
+
+                    encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                    residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                    inputs_embeds, embed_masks_1 = self.chunk_layer(encoder_embeddings_1, routing_output_1.boundary_mask)
+
+                    if self.config.num_stages > 1:
+                        encoder_embeddings_2 = self.encoder_2(inputs_embeds)
+
+                        encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                        residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
+                        routing_output_2 = self.routing_module_2(encoder_embeddings_2)
+                        inputs_embeds, embed_masks_2 = self.chunk_layer(encoder_embeddings_2, routing_output_2.boundary_mask)
+
+                    # compute auxiliary loss for controlling compression ratio
+                    loss_ratio_1 = compute_ratio_loss(routing_output_1.boundary_mask, routing_output_1.boundary_prob[:,:,-1], 4)
+                    loss_ratio_2 = compute_ratio_loss(routing_output_2.boundary_mask, routing_output_2.boundary_prob[:,:,-1], 4)
+
+                    loss_ratio_total = loss_ratio_1 + loss_ratio_2
                     # from .extra_utils import plot_signal_and_mask
                     # plot_signal_and_mask(input_ids, routing_output.boundary_mask)
-                    # inputs_embeds, embed_masks = self.chunk_layer(encoder_embeddings, routing_output.boundary_mask)
                     # breakpoint()
-                    # compute auxiliary loss for controlling compression ratio
-                    loss_ratio = compute_ratio_loss(routing_output.boundary_mask, routing_output.boundary_prob[:,:,-1], 4)
-            else:
-                inputs_embeds = encoder_embeddings
+                # encoder_embeddings_for_residual_1 = encoder_embeddings_1.to(dtype=self.residual_proj_1.weight.dtype)
+                # residual_1 = self.residual_proj_1(encoder_embeddings_for_residual_1)
+
+                # encoder_embeddings_for_residual_2 = encoder_embeddings_2.to(dtype=self.residual_proj_2.weight.dtype)
+                # residual_2 = self.residual_proj_2(encoder_embeddings_for_residual_2)
+
         batch_size, seq_length, _ = inputs_embeds.shape
     
         if position_ids is None:
@@ -1486,8 +1526,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if attention_mask is not None:
             attention_mask = attention_mask[:seq_length, :seq_length]
 
-        if embed_masks is not None:
-            attention_mask = embed_masks.to(attention_mask.dtype) if attention_mask is not None else embed_masks
+        if embed_masks_2 is not None:
+            attention_mask = embed_masks_2.to(attention_mask.dtype) if attention_mask is not None else embed_masks_2
         
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -1547,15 +1587,33 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         # project back to the input space
-        if self.config.patch_embedding_type != "linear":
+        if self.config.patch_embedding_type == "linear":
+            if self.config.num_stages > 1:
+                hidden_states = self.decoder_2(hidden_states)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2).to(hidden_states.dtype)
+ 
+            hidden_states = self.decoder_1(hidden_states)
+            hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1).to(hidden_states.dtype)
+
+        else:
             if self.config.patching_strategy == "fixed":
-                hidden_states = self.upsample(hidden_states)
+                if self.config.num_stages > 1:
+                    hidden_states = self.upsample_2(hidden_states)
+                    hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2).to(hidden_states.dtype)
+                    hidden_states = self.decoder_2(hidden_states)
+
+                hidden_states = self.upsample_1(hidden_states)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1).to(hidden_states.dtype)
+                hidden_states = self.decoder_1(hidden_states)
             else:
-                hidden_states = self.dechunk_layer(hidden_states,routing_output.boundary_mask,routing_output.boundary_prob)
+                if self.config.num_stages > 1:
+                    hidden_states = self.dechunk_layer_2(hidden_states, routing_output_2.boundary_mask, routing_output_2.boundary_prob)
+                    hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2, routing_output_2.selected_probs).to(hidden_states.dtype)
+                    hidden_states = self.decoder_2(hidden_states)
 
-                hidden_states = self.residual_func(hidden_states.to(dtype=residual.dtype), residual, routing_output.selected_probs).to(hidden_states.dtype)
-
-        hidden_states = self.decoder(hidden_states)
+                hidden_states = self.dechunk_layer_1(hidden_states, routing_output_1.boundary_mask, routing_output_1.boundary_prob)
+                hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1, routing_output_1.selected_probs).to(hidden_states.dtype)
+                hidden_states = self.decoder_1(hidden_states)
     
         next_cache = None
         if use_cache:
@@ -1573,7 +1631,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits
-        ), loss_ratio
+        ), loss_ratio_total
 
 
 class TimeMoeOutputLayer(nn.Module):

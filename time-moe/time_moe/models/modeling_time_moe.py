@@ -1477,7 +1477,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
                         inputs_embeds = self.downsample_2(encoder_embeddings_2)
 
-                else:
+                elif self.config.patching_strategy == "adaptive":
                     encoder_embeddings_1 = self.encoder_1(point_inputs_embeds)
                     routing_output_1 = self.routing_module_1(encoder_embeddings_1)
 
@@ -1496,10 +1496,11 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                         inputs_embeds, embed_masks_2 = self.chunk_layer(encoder_embeddings_2, routing_output_2.boundary_mask)
 
                     # compute auxiliary loss for controlling compression ratio
-                    loss_ratio_1 = compute_ratio_loss(routing_output_1.boundary_mask, routing_output_1.boundary_prob[:,:,-1], 4)
-                    loss_ratio_2 = compute_ratio_loss(routing_output_2.boundary_mask, routing_output_2.boundary_prob[:,:,-1], 4)
+                    loss_ratio_total = compute_ratio_loss(routing_output_1.boundary_mask, routing_output_1.boundary_prob[:,:,-1], 4)
+                    if self.config.num_stages > 1:
+                        loss_ratio_2 = compute_ratio_loss(routing_output_2.boundary_mask, routing_output_2.boundary_prob[:,:,-1], 4)
+                        loss_ratio_total += loss_ratio_2
 
-                    loss_ratio_total = loss_ratio_1 + loss_ratio_2
                     # from .extra_utils import plot_signal_and_mask
                     # plot_signal_and_mask(input_ids, routing_output.boundary_mask)
                     # breakpoint()
@@ -1526,9 +1527,9 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         if attention_mask is not None:
             attention_mask = attention_mask[:seq_length, :seq_length]
 
-        if embed_masks_2 is not None:
-            attention_mask = embed_masks_2.to(attention_mask.dtype) if attention_mask is not None else embed_masks_2
-        
+        if embed_masks_1 is not None:
+            attention_mask = embed_masks_1.to(attention_mask.dtype) if attention_mask is not None else embed_masks_1
+
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
             attention_mask,
@@ -1607,11 +1608,11 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 hidden_states = self.decoder_1(hidden_states)
             else:
                 if self.config.num_stages > 1:
-                    hidden_states = self.dechunk_layer_2(hidden_states, routing_output_2.boundary_mask, routing_output_2.boundary_prob)
+                    hidden_states = self.dechunk_layer(hidden_states, routing_output_2.boundary_mask, routing_output_2.boundary_prob)
                     hidden_states = self.residual_func(hidden_states.to(dtype=residual_2.dtype), residual_2, routing_output_2.selected_probs).to(hidden_states.dtype)
                     hidden_states = self.decoder_2(hidden_states)
 
-                hidden_states = self.dechunk_layer_1(hidden_states, routing_output_1.boundary_mask, routing_output_1.boundary_prob)
+                hidden_states = self.dechunk_layer(hidden_states, routing_output_1.boundary_mask, routing_output_1.boundary_prob)
                 hidden_states = self.residual_func(hidden_states.to(dtype=residual_1.dtype), residual_1, routing_output_1.selected_probs).to(hidden_states.dtype)
                 hidden_states = self.decoder_1(hidden_states)
     
